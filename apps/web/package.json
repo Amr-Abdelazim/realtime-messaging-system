@@ -1,0 +1,19 @@
+{
+    "name": "@realtime-messaging/web",
+    "version": "0.1.0",
+    "private": true,
+    "scripts": {
+        "dev": "echo 'Web application placeholder'",
+        "build": "echo 'Web application placeholder'",
+        "typecheck": "tsc --noEmit"
+    },
+    "lint-staged": {
+        "*.{js,mjs,cjs,ts,tsx}": [
+            "eslint --fix",
+            "prettier --write"
+        ],
+        "*.{json,md,yml,yaml}": [
+            "prettier --write"
+        ]
+    }
+}
