@@ -69,4 +69,11 @@ describe('HTTP application', () => {
       name: 'Ada',
     })
   })
+
+  it('should return a readiness response', async () => {
+    const response = await request(app).get('/ready')
+
+    expect([200, 503]).toContain(response.status)
+    expect(['ready', 'not_ready']).toContain(response.body.status)
+  })
 })
