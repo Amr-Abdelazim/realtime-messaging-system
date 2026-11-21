@@ -7,4 +7,17 @@ export default tseslint.config(
     },
     js.configs.recommended,
     ...tseslint.configs.recommended,
+    {
+        rules: {
+            'no-unused-vars': 'off',
+            '@typescript-eslint/no-unused-vars': [
+                'error',
+                {
+                    argsIgnorePattern: '^_',
+                    varsIgnorePattern: '^_',
+                    caughtErrorsIgnorePattern: '^_',
+                },
+            ],
+        },
+    },
 )

@@ -1,3 +1,4 @@
+
 import { defineConfig } from 'vitest/config'
 
 export default defineConfig({
@@ -7,6 +8,7 @@ export default defineConfig({
                 test: {
                     name: 'api',
                     include: ['apps/api/tests/**/*.test.ts'],
+                    setupFiles: ['apps/api/tests/setup.ts'],
                 },
             },
             {
