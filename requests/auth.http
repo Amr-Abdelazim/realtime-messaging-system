@@ -24,3 +24,12 @@ Content-Type: application/json
 ### Get current user
 GET {{baseUrl}}/users/me
 Authorization: Bearer {{login.response.body.$.accessToken}}
+
+### Refresh the session
+POST {{baseUrl}}/auth/refresh
+
+### Refresh again
+POST {{baseUrl}}/auth/refresh
+
+### Log out
+POST {{baseUrl}}/auth/logout

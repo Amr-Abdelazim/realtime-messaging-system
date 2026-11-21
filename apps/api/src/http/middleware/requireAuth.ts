@@ -3,6 +3,7 @@ import type { RequestHandler } from 'express'
 
 import { TokenExpiredError, UnauthenticatedError } from '../errors/index.js'
 import { redis } from '../../infra/redis.js'
+import { revokedSessionKey } from '../../modules/auth/sessions.js'
 import { verifyAccessToken } from '../../modules/auth/tokens.js'
 
 declare global {
@@ -50,7 +51,7 @@ export const requireAuth: RequestHandler = async (req, _res, next) => {
     return
   }
 
-  const revoked = await redis.get(`revoked:sid:${payload.sid}`)
+  const revoked = await redis.get(revokedSessionKey(payload.sid))
   if (revoked !== null) {
     next(new UnauthenticatedError('Session revoked'))
     return
