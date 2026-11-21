@@ -17,6 +17,9 @@
     "db:reset": "pnpm prisma migrate reset --force",
     "prepare": "husky"
   },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  },
   "devDependencies": {
     "@commitlint/cli": "^21.2.4",
     "@commitlint/config-conventional": "^21.2.4",
