@@ -16,12 +16,15 @@ export const ErrorEnvelope = z.object({
     code: z.nativeEnum(ErrorCode),
     message: z.string(),
     details: z
-      .array(
-        z.object({
-          path: z.string(),
-          message: z.string(),
-        }),
-      )
+      .union([
+        z.array(
+          z.object({
+            path: z.string(),
+            message: z.string(),
+          }),
+        ),
+        z.object({ field: z.string() }),
+      ])
       .nullable()
       .optional(),
   }),
