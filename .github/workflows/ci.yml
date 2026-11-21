@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  checks:
+  ci:
     name: Quality checks
     runs-on: ubuntu-latest
 
@@ -63,7 +63,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 22
           cache: pnpm
 
       - name: Install dependencies
@@ -77,7 +77,7 @@ jobs:
 
       - name: Create test database
         run: |
-          PGPASSWORD=messaging_dev psql -h localhost -U messaging -d messaging -c 'CREATE DATABASE chat_test;' || true
+          PGPASSWORD=messaging_dev psql -h localhost -U messaging -d messaging -c 'CREATE DATABASE chat_test;'
 
       - name: Apply migrations
         run: |
