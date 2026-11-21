@@ -25,6 +25,17 @@ export const RegisterBody = z.object({
 
 export type RegisterBody = z.infer<typeof RegisterBody>
 
+export const LoginBody = z.object({
+  email: z
+    .string()
+    .trim()
+    .email()
+    .transform((email) => email.toLowerCase()),
+  password: z.string().min(1).max(72),
+})
+
+export type LoginBody = z.infer<typeof LoginBody>
+
 export const UserDto = z.object({
   id: IdSchema,
   username: z.string(),

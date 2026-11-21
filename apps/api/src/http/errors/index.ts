@@ -1,10 +1,11 @@
-export { AppError } from "./app-error.js";
+export { AppError } from './app-error.js'
 
 export {
-    ValidationError,
-    UnauthenticatedError,
-    ForbiddenError,
-    NotFoundError,
-    ConflictError,
-    RateLimitedError,
-} from "./subclasses.js";
+  ValidationError,
+  UnauthenticatedError,
+  TokenExpiredError,
+  ForbiddenError,
+  NotFoundError,
+  ConflictError,
+  RateLimitedError,
+} from './subclasses.js'

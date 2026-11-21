@@ -1,15 +1,16 @@
 import { randomUUID } from 'node:crypto'
 import { PrismaClient } from '@prisma/client'
 import argon2 from 'argon2'
-import { jwtVerify } from 'jose'
+import { jwtVerify, SignJWT } from 'jose'
 import request from 'supertest'
 import { afterAll, beforeEach, describe, expect, it } from 'vitest'
 
 import { AuthResponse } from '@realtime-messaging/contracts'
 import { env } from '../../src/config/env.js'
 import { createApp } from '../../src/http/app.js'
+import { redis } from '../../src/infra/redis.js'
 import { REFRESH_COOKIE_NAME } from '../../src/modules/auth/cookies.js'
-import { hashRefreshToken } from '../../src/modules/auth/tokens.js'
+import { hashRefreshToken, signAccessToken } from '../../src/modules/auth/tokens.js'
 import { disconnectDb, resetDb } from '../helpers/db.js'
 
 const app = createApp()
@@ -25,7 +26,7 @@ const makeRegistration = () => {
   }
 }
 
-describe.skipIf(process.env.CI !== 'true')('POST /api/v1/auth/register', () => {
+describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
   beforeEach(async () => {
     await resetDb()
   })
@@ -147,6 +148,139 @@ describe.skipIf(process.env.CI !== 'true')('POST /api/v1/auth/register', () => {
         expect.objectContaining({ path: 'username' }),
         expect.objectContaining({ path: 'password' }),
         expect.objectContaining({ path: 'displayName' }),
+      ]),
+    )
+  })
+
+  it('logs in and uses the access token to get the current user', async () => {
+    const registration = makeRegistration()
+    await request(app).post('/api/v1/auth/register').send(registration).expect(201)
+
+    const response = await request(app)
+      .post('/api/v1/auth/login')
+      .set('user-agent', 't06-login-test-agent')
+      .send({
+        email: registration.email.toUpperCase(),
+        password: registration.password,
+      })
+
+    expect(response.status).toBe(200)
+    const auth = AuthResponse.parse(response.body)
+    expect(auth.user.email).toBe(registration.email)
+    expect(auth.user.username).toBe(registration.username)
+    expect(response.headers['set-cookie']?.[0]).toContain(`${REFRESH_COOKIE_NAME}=`)
+    expect(response.headers['set-cookie']?.[0]).toContain('HttpOnly')
+    expect(response.headers['set-cookie']?.[0]).toContain('SameSite=Lax')
+
+    const session = await prisma.session.findFirstOrThrow({
+      where: { userId: auth.user.id, userAgent: 't06-login-test-agent' },
+    })
+    expect(session.ip).toBeTruthy()
+
+    const meResponse = await request(app)
+      .get('/api/v1/users/me')
+      .set('authorization', `Bearer ${auth.accessToken}`)
+
+    expect(meResponse.status).toBe(200)
+    expect(meResponse.body).toEqual(auth.user)
+  })
+
+  it('returns the same unauthenticated response for an unknown email and a wrong password', async () => {
+    const registration = makeRegistration()
+    await request(app).post('/api/v1/auth/register').send(registration).expect(201)
+
+    const wrongPassword = await request(app).post('/api/v1/auth/login').send({
+      email: registration.email,
+      password: 'WrongPassword123!',
+    })
+    const unknownEmail = await request(app)
+      .post('/api/v1/auth/login')
+      .send({
+        email: `unknown-${registration.email}`,
+        password: registration.password,
+      })
+
+    expect(wrongPassword.status).toBe(401)
+    expect(unknownEmail.status).toBe(401)
+    expect(wrongPassword.body.error.code).toBe('UNAUTHENTICATED')
+    expect(unknownEmail.body.error.code).toBe('UNAUTHENTICATED')
+    expect(wrongPassword.body.error.message).toBe('Invalid email or password')
+    expect(unknownEmail.body.error.message).toBe('Invalid email or password')
+  })
+
+  it('rejects requests to the current-user route without a bearer token', async () => {
+    const response = await request(app).get('/api/v1/users/me')
+
+    expect(response.status).toBe(401)
+    expect(response.body.error.code).toBe('UNAUTHENTICATED')
+  })
+
+  it('returns TOKEN_EXPIRED for an expired access token', async () => {
+    const now = Math.floor(Date.now() / 1000)
+    const expiredToken = await new SignJWT({ sid: randomUUID() })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setSubject(randomUUID())
+      .setIssuedAt(now - 120)
+      .setExpirationTime(now - 60)
+      .sign(new TextEncoder().encode(env.JWT_ACCESS_SECRET))
+
+    const response = await request(app)
+      .get('/api/v1/users/me')
+      .set('authorization', `Bearer ${expiredToken}`)
+
+    expect(response.status).toBe(401)
+    expect(response.body.error.code).toBe('TOKEN_EXPIRED')
+  })
+
+  it('rejects a token with an invalid signature', async () => {
+    const invalidToken = await new SignJWT({ sid: randomUUID() })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setSubject(randomUUID())
+      .setIssuedAt()
+      .setExpirationTime('1h')
+      .sign(new TextEncoder().encode('not-the-configured-test-secret-32-chars'))
+
+    const response = await request(app)
+      .get('/api/v1/users/me')
+      .set('authorization', `Bearer ${invalidToken}`)
+
+    expect(response.status).toBe(401)
+    expect(response.body.error.code).toBe('UNAUTHENTICATED')
+  })
+
+  it('rejects an access token when its session id is revoked in Redis', async () => {
+    const sessionId = randomUUID()
+    const redisKey = `revoked:sid:${sessionId}`
+    await redis.set(redisKey, '1')
+
+    try {
+      const accessToken = await signAccessToken({
+        userId: randomUUID(),
+        sessionId,
+      })
+      const response = await request(app)
+        .get('/api/v1/users/me')
+        .set('authorization', `Bearer ${accessToken}`)
+
+      expect(response.status).toBe(401)
+      expect(response.body.error.code).toBe('UNAUTHENTICATED')
+    } finally {
+      await redis.del(redisKey)
+    }
+  })
+
+  it('rejects invalid login fields with validation details', async () => {
+    const response = await request(app).post('/api/v1/auth/login').send({
+      email: 'not-an-email',
+      password: '',
+    })
+
+    expect(response.status).toBe(400)
+    expect(response.body.error.code).toBe('VALIDATION_ERROR')
+    expect(response.body.error.details).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: 'email' }),
+        expect.objectContaining({ path: 'password' }),
       ]),
     )
   })
