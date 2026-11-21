@@ -1,0 +1,119 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ConversationType {
+  DIRECT
+  GROUP
+}
+
+enum ParticipantRole {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum MessageType {
+  TEXT
+  SYSTEM
+}
+
+model User {
+  id           String    @id @default(uuid())
+  username     String    @unique
+  email        String    @unique
+  passwordHash String
+  displayName  String
+  avatarUrl    String?
+  lastSeenAt   DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  sessions             Session[]
+  participants         Participant[]
+  messages             Message[]
+  createdConversations Conversation[] @relation("ConversationCreator")
+
+  @@index([displayName])
+}
+
+model Session {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  familyId  String
+  tokenHash String    @unique
+  userAgent String?
+  ip        String?
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@index([familyId])
+  @@index([expiresAt])
+}
+
+model Conversation {
+  id            String           @id @default(uuid())
+  type          ConversationType
+  name          String?
+  directKey     String?          @unique
+  createdById   String?
+  createdBy     User?            @relation("ConversationCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  lastSeq       Int              @default(0)
+  lastMessageId String?          @unique
+  lastMessage   Message?         @relation("LastMessage", fields: [lastMessageId], references: [id], onDelete: SetNull)
+  lastMessageAt DateTime?
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+
+  participants Participant[]
+  messages     Message[]     @relation("ConversationMessages")
+
+  @@index([lastMessageAt(sort: Desc)])
+}
+
+model Participant {
+  conversationId   String
+  conversation     Conversation    @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  userId           String
+  user             User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role             ParticipantRole @default(MEMBER)
+  joinedAt         DateTime        @default(now())
+  leftAt           DateTime?
+  lastDeliveredSeq Int             @default(0)
+  lastReadSeq      Int             @default(0)
+  unreadCount      Int             @default(0)
+  joinedAtSeq      Int             @default(0)
+
+  @@id([conversationId, userId])
+  @@index([userId, leftAt])
+}
+
+model Message {
+  id              String        @id @default(uuid())
+  conversationId  String
+  conversation    Conversation  @relation("ConversationMessages", fields: [conversationId], references: [id], onDelete: Cascade)
+  seq             Int
+  senderId        String?
+  sender          User?         @relation(fields: [senderId], references: [id], onDelete: SetNull)
+  type            MessageType   @default(TEXT)
+  content         String        @db.VarChar(4000)
+  clientMessageId String
+  replyToId       String?
+  replyTo         Message?      @relation("Replies", fields: [replyToId], references: [id], onDelete: SetNull)
+  replies         Message[]     @relation("Replies")
+  createdAt       DateTime      @default(now())
+  deletedAt       DateTime?
+  lastMessageOf   Conversation? @relation("LastMessage")
+
+  @@unique([conversationId, seq])
+  @@unique([senderId, clientMessageId])
+  @@index([conversationId, seq(sort: Desc)])
+}
