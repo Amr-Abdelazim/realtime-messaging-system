@@ -1,5 +1,5 @@
 import { randomBytes, createHash } from 'node:crypto'
-import { SignJWT } from 'jose'
+import { jwtVerify, SignJWT, type JWTPayload } from 'jose'
 
 import { env } from '../../config/env.js'
 
@@ -20,6 +20,13 @@ export async function signAccessToken({
     .setIssuedAt(issuedAt)
     .setExpirationTime(issuedAt + env.JWT_ACCESS_TTL_SECONDS)
     .sign(accessTokenSecret)
+}
+
+export function verifyAccessToken(token: string): Promise<{ payload: JWTPayload }> {
+  return jwtVerify(token, accessTokenSecret, {
+    algorithms: ['HS256'],
+    requiredClaims: ['sub', 'sid', 'exp'],
+  })
 }
 
 export function generateRefreshToken(): string {

@@ -13,6 +13,12 @@ export class UnauthenticatedError extends AppError {
   }
 }
 
+export class TokenExpiredError extends AppError {
+  constructor(message = 'Access token expired') {
+    super(ErrorCode.TOKEN_EXPIRED, 401, message)
+  }
+}
+
 export class ForbiddenError extends AppError {
   constructor(message = 'Access forbidden') {
     super(ErrorCode.FORBIDDEN, 403, message)

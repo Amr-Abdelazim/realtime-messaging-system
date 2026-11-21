@@ -11,6 +11,7 @@ import { errorHandler } from './middleware/error-handler.js'
 import healthRouter from './routes/health.js'
 import readyRouter from './routes/ready.js'
 import authRouter from './routes/auth.js'
+import usersRouter from './routes/users.js'
 
 export function createApp(): Express {
   const app = express()
@@ -39,6 +40,7 @@ export function createApp(): Express {
   app.use(healthRouter)
   app.use(readyRouter)
   app.use('/api/v1', authRouter)
+  app.use('/api/v1', usersRouter)
   // Error handling (must remain last)
   app.use(notFoundHandler)
   app.use(errorHandler)

@@ -7,6 +7,7 @@ import {
   ErrorEnvelope,
   IdSchema,
   IsoDateSchema,
+  LoginBody,
   PaginationQuery,
   RegisterBody,
 } from '../src/index.js'
@@ -83,6 +84,18 @@ describe('shared contracts', () => {
         accessToken: 'signed-jwt',
       }).success,
     ).toBe(true)
+  })
+
+  it('normalizes login email without changing the password', () => {
+    expect(
+      LoginBody.parse({
+        email: ' ALICE@EXAMPLE.COM ',
+        password: ' Password123! ',
+      }),
+    ).toEqual({
+      email: 'alice@example.com',
+      password: ' Password123! ',
+    })
   })
 
   it('can be composed with package schemas', () => {
