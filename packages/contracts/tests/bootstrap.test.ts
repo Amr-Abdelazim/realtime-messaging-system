@@ -1,7 +1,15 @@
 import { describe, expect, it } from 'vitest'
 import { z } from 'zod'
 
-import { ErrorCode, ErrorEnvelope, IdSchema, IsoDateSchema, PaginationQuery } from '../src/index.js'
+import {
+  AuthResponse,
+  ErrorCode,
+  ErrorEnvelope,
+  IdSchema,
+  IsoDateSchema,
+  PaginationQuery,
+  RegisterBody,
+} from '../src/index.js'
 
 describe('shared contracts', () => {
   it('validates ids and ISO timestamps', () => {
@@ -33,6 +41,46 @@ describe('shared contracts', () => {
           message: 'Internal server error',
           details: null,
         },
+      }).success,
+    ).toBe(true)
+
+    expect(
+      ErrorEnvelope.safeParse({
+        error: {
+          code: ErrorCode.CONFLICT,
+          message: 'Email already in use',
+          details: { field: 'email' },
+        },
+      }).success,
+    ).toBe(true)
+  })
+
+  it('normalizes and validates registration contracts', () => {
+    const registration = RegisterBody.parse({
+      email: 'ALICE@EXAMPLE.COM',
+      username: 'Alice_1',
+      password: 'Password123!',
+      displayName: ' Alice ',
+    })
+
+    expect(registration).toEqual({
+      email: 'alice@example.com',
+      username: 'alice_1',
+      password: 'Password123!',
+      displayName: 'Alice',
+    })
+
+    expect(
+      AuthResponse.safeParse({
+        user: {
+          id: 'user-1',
+          username: 'alice_1',
+          displayName: 'Alice',
+          avatarUrl: null,
+          createdAt: '2026-11-21T23:48:30.884Z',
+          email: 'alice@example.com',
+        },
+        accessToken: 'signed-jwt',
       }).success,
     ).toBe(true)
   })
