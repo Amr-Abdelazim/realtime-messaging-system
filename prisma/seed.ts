@@ -7,13 +7,15 @@ const prisma = new PrismaClient()
 async function main(): Promise<void> {
   const passwordHash = await argon2.hash('Password123!')
   const users = await Promise.all(
-    [
-      ['alice', 'alice@example.com', 'Alice'],
-      ['bob', 'bob@example.com', 'Bob'],
-      ['carol', 'carol@example.com', 'Carol'],
-      ['dave', 'dave@example.com', 'Dave'],
-      ['erin', 'erin@example.com', 'Erin'],
-    ].map(([username, email, displayName]) =>
+    (
+      [
+        ['alice', 'alice@example.com', 'Alice'],
+        ['bob', 'bob@example.com', 'Bob'],
+        ['carol', 'carol@example.com', 'Carol'],
+        ['dave', 'dave@example.com', 'Dave'],
+        ['erin', 'erin@example.com', 'Erin'],
+      ] as const
+    ).map(([username, email, displayName]) =>
       prisma.user.create({
         data: {
           username,
