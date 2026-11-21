@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "tsx watch src/main.ts",
     "build": "tsc",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tests/tsconfig.json"
   },
   "prisma": {
     "seed": "tsx ../../prisma/seed.ts"
