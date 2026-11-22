@@ -20,3 +20,7 @@ watermarks and unread count.
 Senders can delete their own messages with the Socket.IO `message:delete`
 event or `DELETE /messages/:id`. Deletion is idempotent; system messages cannot
 be deleted.
+
+Authenticated clients can query `GET /presence?ids=userId1,userId2` for up to
+50 users. Socket clients should emit `presence:ping` every 25 seconds; socket
+presence expires after 60 seconds without a heartbeat.

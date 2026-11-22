@@ -18,6 +18,8 @@ import {
   MessageHistoryQuery,
   MessageHistoryResponse,
   PaginationQuery,
+  PresenceListResponse,
+  PresenceQuery,
   RegisterBody,
   SendMessageAck,
   SendMessageInput,
@@ -213,6 +215,22 @@ describe('shared contracts', () => {
     expect(deriveStatus(2, receipts)).toBe('read')
     expect(deriveStatus(4, receipts)).toBe('delivered')
     expect(deriveStatus(5, receipts)).toBe('sent')
+  })
+
+  it('validates presence queries and response items', () => {
+    expect(PresenceQuery.parse({ ids: 'user-123, user-456' })).toEqual({
+      ids: ['user-123', 'user-456'],
+    })
+    expect(
+      PresenceQuery.safeParse({
+        ids: Array.from({ length: 51 }, (_, index) => `user-${index}`).join(','),
+      }).success,
+    ).toBe(false)
+    expect(
+      PresenceListResponse.parse({
+        items: [{ userId: 'user-123', online: false, lastSeenAt: null }],
+      }).items,
+    ).toEqual([{ userId: 'user-123', online: false, lastSeenAt: null }])
   })
 
   it('validates socket message-send payloads and acknowledgements', () => {

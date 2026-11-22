@@ -48,6 +48,11 @@ socket.on('connect', () => {
 socket.on('connect_error', (error) => {
   console.error(`Connection failed: ${error.message}`)
 })
+const presenceHeartbeat = setInterval(() => {
+  if (socket.connected) {
+    socket.emit('presence:ping')
+  }
+}, 25_000)
 
 const input = createInterface({ input: process.stdin, output: process.stdout })
 const commands =
@@ -113,5 +118,6 @@ input.on('line', (line) => {
   console.log(`Unknown command: ${command || '(empty)'}`)
 })
 input.on('close', () => {
+  clearInterval(presenceHeartbeat)
   socket.disconnect()
 })

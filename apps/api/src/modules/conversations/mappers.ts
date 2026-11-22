@@ -25,6 +25,7 @@ export const conversationInclude = {
         select: {
           displayName: true,
           avatarUrl: true,
+          lastSeenAt: true,
         },
       },
     },
@@ -53,6 +54,7 @@ export const conversationListSelect = {
         select: {
           displayName: true,
           avatarUrl: true,
+          lastSeenAt: true,
         },
       },
     },
@@ -83,6 +85,7 @@ function mapConversationDto(
   memberCount: number,
   viewer: { unreadCount: number; lastReadSeq: number },
   receipts: ConversationReceiptsType,
+  peerPresence: ConversationDto['peerPresence'],
 ) {
   return ConversationDto.parse({
     id: row.id,
@@ -100,7 +103,7 @@ function mapConversationDto(
     unreadCount: viewer.unreadCount,
     myLastReadSeq: viewer.lastReadSeq,
     receipts,
-    peerPresence: null,
+    peerPresence,
   })
 }
 
@@ -116,7 +119,11 @@ function getReceipts(
   })
 }
 
-export function toConversationDto(row: ConversationWithRelations, viewerId: string) {
+export function toConversationDto(
+  row: ConversationWithRelations,
+  viewerId: string,
+  peerPresence: ConversationDto['peerPresence'] = null,
+) {
   const viewer = row.participants.find((participant) => participant.userId === viewerId)
   if (!viewer) {
     throw new Error('Cannot map a conversation for a non-member')
@@ -128,6 +135,7 @@ export function toConversationDto(row: ConversationWithRelations, viewerId: stri
     row.participants.length,
     viewer,
     getReceipts(row.participants, viewerId),
+    peerPresence,
   )
 }
 
@@ -136,10 +144,11 @@ export function toConversationListDto(
   viewerId: string,
   viewer: { unreadCount: number; lastReadSeq: number },
   receipts: ConversationReceiptsType,
+  peerPresence: ConversationDto['peerPresence'] = null,
 ) {
   const members =
     row.type === 'DIRECT'
       ? row.participants.filter((participant) => participant.userId !== viewerId)
       : row.participants
-  return mapConversationDto(row, members, row._count.participants, viewer, receipts)
+  return mapConversationDto(row, members, row._count.participants, viewer, receipts, peerPresence)
 }

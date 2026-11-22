@@ -48,6 +48,8 @@ export const TypingInput = z.object({
 
 export type TypingInput = z.infer<typeof TypingInput>
 
+export const PresencePingInput = z.undefined()
+
 export interface ClientToServerEvents {
   'message:send': (
     payload: SendMessageInput,
