@@ -14,3 +14,7 @@ Clients can also mark a conversation as read over REST with
 `POST /conversations/:id/read` and a JSON body such as `{"upToSeq": 12}`. The
 endpoint returns `204 No Content`; both REST and Socket.IO update the same read
 watermarks and unread count.
+
+Senders can delete their own messages with the Socket.IO `message:delete`
+event or `DELETE /messages/:id`. Deletion is idempotent; system messages cannot
+be deleted.

@@ -30,6 +30,7 @@ import { disconnectDb, resetDb } from '../helpers/db.js'
 type TestSocket = ClientSocket<ServerToClientEvents, ClientToServerEvents>
 type EmptyAck = SocketAck<Record<string, never>>
 type ReadAck = SocketAck<{ unreadCount: number }>
+type DeleteAck = SocketAck<{ messageId: string; seq: number }>
 
 const socketGateway = new SocketGateway()
 const app = createApp({
@@ -133,6 +134,10 @@ function markRead(
   input: { conversationId: string; upToSeq: number },
 ): Promise<ReadAck> {
   return new Promise((resolve) => socket.emit('conversation:read', input, resolve))
+}
+
+function deleteMessage(socket: TestSocket, messageId: string): Promise<DeleteAck> {
+  return new Promise((resolve) => socket.emit('message:delete', { messageId }, resolve))
 }
 
 async function createRegisteredSession(
@@ -1742,6 +1747,130 @@ describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
     expect(participants.find(({ userId }) => userId === recipient.auth.user.id)?.unreadCount).toBe(
       1,
     )
+  })
+
+  it('deletes only the sender message once and preserves its tombstone in history and chat list', async () => {
+    const sender = await createRegisteredSession()
+    const recipient = await createRegisteredSession()
+    const conversation = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${sender.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: recipient.auth.user.id })
+      .expect(201)
+    const conversationId = conversation.body.id as string
+    const messages = new MessagesService()
+    const first = await messages.sendMessage(sender.auth.user.id, {
+      conversationId,
+      clientMessageId: randomUUID(),
+      content: 'First message',
+    })
+    const latest = await messages.sendMessage(sender.auth.user.id, {
+      conversationId,
+      clientMessageId: randomUUID(),
+      content: 'Latest message',
+    })
+    expect([first.message.seq, latest.message.seq]).toEqual([1, 2])
+
+    const senderSocket = connectSocket(sender.auth.accessToken)
+    const recipientSocket = connectSocket(recipient.auth.accessToken)
+    await Promise.all([waitForReady(senderSocket), waitForReady(recipientSocket)])
+    const deletedEvents: Array<{ conversationId: string; messageId: string; seq: number }> = []
+    recipientSocket.on('message:deleted', (event) => deletedEvents.push(event))
+
+    const latestDeletedEvent = new Promise((resolve) => {
+      recipientSocket.once('message:deleted', resolve)
+    })
+    expect(await deleteMessage(senderSocket, latest.message.id)).toEqual({
+      ok: true,
+      data: { messageId: latest.message.id, seq: 2 },
+    })
+    expect(await latestDeletedEvent).toEqual({
+      conversationId,
+      messageId: latest.message.id,
+      seq: 2,
+    })
+    expect(await deleteMessage(senderSocket, latest.message.id)).toEqual({
+      ok: true,
+      data: { messageId: latest.message.id, seq: 2 },
+    })
+
+    const firstDeletedEvent = new Promise((resolve) => {
+      recipientSocket.once('message:deleted', resolve)
+    })
+    await request(app)
+      .delete(`/api/v1/messages/${first.message.id}`)
+      .set('authorization', `Bearer ${sender.auth.accessToken}`)
+      .expect(204)
+    expect(await firstDeletedEvent).toEqual({
+      conversationId,
+      messageId: first.message.id,
+      seq: 1,
+    })
+    await request(app)
+      .delete(`/api/v1/messages/${first.message.id}`)
+      .set('authorization', `Bearer ${sender.auth.accessToken}`)
+      .expect(204)
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(deletedEvents).toEqual([
+      { conversationId, messageId: latest.message.id, seq: 2 },
+      { conversationId, messageId: first.message.id, seq: 1 },
+    ])
+    await request(app)
+      .delete(`/api/v1/messages/${latest.message.id}`)
+      .set('authorization', `Bearer ${recipient.auth.accessToken}`)
+      .expect(403)
+
+    const persisted = await prisma.message.findUniqueOrThrow({
+      where: { id: latest.message.id },
+    })
+    expect(persisted).toMatchObject({
+      seq: 2,
+      content: 'Latest message',
+      deletedAt: expect.any(Date),
+    })
+    const conversationRow = await prisma.conversation.findUniqueOrThrow({
+      where: { id: conversationId },
+      select: { lastMessageId: true },
+    })
+    expect(conversationRow.lastMessageId).toBe(latest.message.id)
+
+    const history = await request(app)
+      .get(`/api/v1/conversations/${conversationId}/messages`)
+      .set('authorization', `Bearer ${recipient.auth.accessToken}`)
+      .expect(200)
+    expect(history.body.items.map((item: { content: string | null; seq: number }) => item)).toEqual(
+      [
+        expect.objectContaining({ content: null, seq: 2 }),
+        expect.objectContaining({ content: null, seq: 1 }),
+      ],
+    )
+    const chatList = await request(app)
+      .get('/api/v1/conversations')
+      .set('authorization', `Bearer ${recipient.auth.accessToken}`)
+      .expect(200)
+    expect(chatList.body.items[0]).toMatchObject({
+      id: conversationId,
+      unreadCount: 0,
+      lastMessage: { id: latest.message.id, content: null, seq: 2 },
+    })
+    const recipientParticipant = await prisma.participant.findUniqueOrThrow({
+      where: { conversationId_userId: { conversationId, userId: recipient.auth.user.id } },
+    })
+    expect(recipientParticipant.unreadCount).toBe(0)
+
+    const group = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${sender.auth.accessToken}`)
+      .send({ type: 'GROUP', name: 'System message deletion', memberIds: [recipient.auth.user.id] })
+      .expect(201)
+    const systemMessage = await prisma.message.findFirstOrThrow({
+      where: { conversationId: group.body.id, type: 'SYSTEM' },
+    })
+    await request(app)
+      .delete(`/api/v1/messages/${systemMessage.id}`)
+      .set('authorization', `Bearer ${sender.auth.accessToken}`)
+      .expect(400)
   })
 
   it('advances delivery and read watermarks monotonically and recounts unread messages', async () => {

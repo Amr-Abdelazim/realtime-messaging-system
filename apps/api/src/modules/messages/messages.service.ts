@@ -1,12 +1,78 @@
 import { SendMessageAck, type SendMessageInput } from '@realtime-messaging/contracts'
 import { Prisma } from '@prisma/client'
 
-import { ForbiddenError, ValidationError } from '../../http/errors/index.js'
+import { ForbiddenError, NotFoundError, ValidationError } from '../../http/errors/index.js'
 import { prisma } from '../../infra/prisma.js'
 import { messageWithReplyInclude, toMessageDto } from './mappers.js'
 import { allocateSeq } from './seq.js'
 
 export class MessagesService {
+  async deleteMessage(userId: string, messageId: string) {
+    return prisma.$transaction(async (tx) => {
+      const current = await tx.message.findUnique({
+        where: { id: messageId },
+        select: { conversationId: true },
+      })
+      if (!current) {
+        throw new NotFoundError('Message not found')
+      }
+
+      await tx.$queryRaw`
+        SELECT "id" FROM "Conversation" WHERE "id" = ${current.conversationId} FOR UPDATE
+      `
+
+      const message = await tx.message.findUnique({
+        where: { id: messageId },
+        select: {
+          conversationId: true,
+          seq: true,
+          senderId: true,
+          type: true,
+          deletedAt: true,
+        },
+      })
+      if (!message) {
+        throw new NotFoundError('Message not found')
+      }
+      if (message.type === 'SYSTEM') {
+        throw new ValidationError('System messages cannot be deleted')
+      }
+      if (message.senderId !== userId) {
+        throw new ForbiddenError()
+      }
+      if (message.deletedAt) {
+        return {
+          deleted: false,
+          conversationId: message.conversationId,
+          messageId,
+          seq: message.seq,
+        }
+      }
+
+      await tx.message.update({
+        where: { id: messageId },
+        data: { deletedAt: new Date() },
+      })
+      await tx.participant.updateMany({
+        where: {
+          conversationId: message.conversationId,
+          userId: { not: userId },
+          leftAt: null,
+          lastReadSeq: { lt: message.seq },
+          unreadCount: { gt: 0 },
+        },
+        data: { unreadCount: { decrement: 1 } },
+      })
+
+      return {
+        deleted: true,
+        conversationId: message.conversationId,
+        messageId,
+        seq: message.seq,
+      }
+    })
+  }
+
   async sendMessage(senderId: string, input: SendMessageInput): Promise<SendMessageAck> {
     try {
       const result = await prisma.$transaction(async (tx) => {

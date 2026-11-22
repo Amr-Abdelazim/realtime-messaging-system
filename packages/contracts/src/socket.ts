@@ -23,6 +23,12 @@ export const SendMessageAck = z.object({
 
 export type SendMessageAck = z.infer<typeof SendMessageAck>
 
+export const MessageDeleteInput = z.object({
+  messageId: IdSchema,
+})
+
+export type MessageDeleteInput = z.infer<typeof MessageDeleteInput>
+
 export const MessageDeliveredInput = z.object({
   conversationId: IdSchema,
   upToSeq: z.number().int().nonnegative(),
@@ -42,7 +48,7 @@ export interface ClientToServerEvents {
     ack: (response: SocketAck<SendMessageAck>) => void,
   ) => void
   'message:delete': (
-    payload: { messageId: string },
+    payload: MessageDeleteInput,
     ack: (response: SocketAck<{ messageId: string; seq: number }>) => void,
   ) => void
   'message:delivered': (

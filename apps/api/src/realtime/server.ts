@@ -13,6 +13,7 @@ import { RateLimitedError } from '../http/errors/index.js'
 import { rateLimit } from '../infra/rateLimit.js'
 import {
   ConversationReadInput,
+  MessageDeleteInput,
   MessageDeliveredInput,
   SendMessageInput,
 } from '@realtime-messaging/contracts'
@@ -91,6 +92,18 @@ export function createRealtimeServer(
         io.to(`conv:${input.conversationId}`).emit('message:new', { message: result.message })
       }
       return result
+    })
+
+    handle(socket, 'message:delete', MessageDeleteInput, async (input) => {
+      const result = await messages.deleteMessage(socket.data.userId, input.messageId)
+      if (result.deleted) {
+        io.to(`conv:${result.conversationId}`).emit('message:deleted', {
+          conversationId: result.conversationId,
+          messageId: result.messageId,
+          seq: result.seq,
+        })
+      }
+      return { messageId: result.messageId, seq: result.seq }
     })
 
     handle(socket, 'message:delivered', MessageDeliveredInput, async (input) => {
