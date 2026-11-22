@@ -12,6 +12,7 @@ const envSchema = z
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
 
     PORT: z.coerce.number().int().positive().default(3000),
+    TRUST_PROXY: z.coerce.number().int().nonnegative().default(0),
 
     DATABASE_URL: z.string().url(),
 

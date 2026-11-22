@@ -1,6 +1,6 @@
 import type { ErrorRequestHandler } from 'express'
 import { ErrorCode } from '@realtime-messaging/contracts'
-import { AppError } from '../errors/index.js'
+import { AppError, RateLimitedError } from '../errors/index.js'
 import { logger } from '../../infra/logger.js'
 
 export const errorHandler: ErrorRequestHandler = (err, req, res, _next) => {
@@ -9,6 +9,10 @@ export const errorHandler: ErrorRequestHandler = (err, req, res, _next) => {
   const status = isOperational ? err.status : 500
   const code = isOperational ? err.code : ErrorCode.INTERNAL
   const message = isOperational ? err.message : 'Internal server error'
+
+  if (err instanceof RateLimitedError && err.retryAfterSeconds !== undefined) {
+    res.setHeader('Retry-After', String(err.retryAfterSeconds))
+  }
 
   if (isOperational) {
     logger.warn(

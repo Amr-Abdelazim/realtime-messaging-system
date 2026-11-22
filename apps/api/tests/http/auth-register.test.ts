@@ -14,7 +14,13 @@ import { hashRefreshToken, signAccessToken } from '../../src/modules/auth/tokens
 import { revokedSessionKey } from '../../src/modules/auth/sessions.js'
 import { disconnectDb, resetDb } from '../helpers/db.js'
 
-const app = createApp()
+const app = createApp({
+  rateLimits: {
+    api: { limit: 1000, windowSeconds: 60 },
+    register: { limit: 1000, windowSeconds: 60 },
+    login: { limit: 1000, windowSeconds: 60 },
+  },
+})
 const prisma = new PrismaClient()
 
 const makeRegistration = () => {
@@ -26,6 +32,8 @@ const makeRegistration = () => {
     displayName: 'Test User',
   }
 }
+
+const makeTestIp = () => `192.0.2.${Math.floor(Math.random() * 254) + 1}`
 
 function getRefreshToken(response: { headers: { 'set-cookie'?: string[] } }): string {
   const cookie = response.headers['set-cookie']?.find((value) =>
@@ -309,6 +317,208 @@ describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
         expect.objectContaining({ path: 'password' }),
       ]),
     )
+  })
+
+  it('limits the eleventh login attempt from the same IP and sets Retry-After', async () => {
+    const ip = makeTestIp()
+    const limitedApp = createApp({ trustProxy: 1 })
+    const failureKeys: string[] = []
+
+    try {
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        const email = `unknown-${randomUUID()}@example.com`
+        failureKeys.push(`login:fail:${email}`)
+        const response = await request(limitedApp)
+          .post('/api/v1/auth/login')
+          .set('x-forwarded-for', ip)
+          .send({ email, password: 'WrongPassword123!' })
+        expect(response.status).toBe(401)
+      }
+
+      const email = `unknown-${randomUUID()}@example.com`
+      failureKeys.push(`login:fail:${email}`)
+      const limited = await request(limitedApp)
+        .post('/api/v1/auth/login')
+        .set('x-forwarded-for', ip)
+        .send({ email, password: 'WrongPassword123!' })
+
+      expect(limited.status).toBe(429)
+      expect(limited.body.error.code).toBe('RATE_LIMITED')
+      expect(Number(limited.headers['retry-after'])).toBeGreaterThan(0)
+    } finally {
+      await redis.del(`rate-limit:api:${ip}`, `rate-limit:login:${ip}`, ...failureKeys)
+    }
+  })
+
+  it('applies login rate limits independently per IP', async () => {
+    const firstIp = makeTestIp()
+    let secondIp = makeTestIp()
+    while (secondIp === firstIp) {
+      secondIp = makeTestIp()
+    }
+    const limitedApp = createApp({
+      trustProxy: 1,
+      rateLimits: {
+        api: { limit: 100, windowSeconds: 60 },
+        login: { limit: 1, windowSeconds: 60 },
+      },
+    })
+    const failureKeys: string[] = []
+
+    const attemptLogin = async (ip: string) => {
+      const email = `unknown-${randomUUID()}@example.com`
+      failureKeys.push(`login:fail:${email}`)
+      return request(limitedApp)
+        .post('/api/v1/auth/login')
+        .set('x-forwarded-for', ip)
+        .send({ email, password: 'WrongPassword123!' })
+    }
+
+    try {
+      expect((await attemptLogin(firstIp)).status).toBe(401)
+      const limited = await attemptLogin(firstIp)
+      expect(limited.status).toBe(429)
+      expect(Number(limited.headers['retry-after'])).toBeGreaterThan(0)
+      expect((await attemptLogin(secondIp)).status).toBe(401)
+    } finally {
+      await redis.del(
+        `rate-limit:api:${firstIp}`,
+        `rate-limit:login:${firstIp}`,
+        `rate-limit:api:${secondIp}`,
+        `rate-limit:login:${secondIp}`,
+        ...failureKeys,
+      )
+    }
+  })
+
+  it('rate limits registration by IP', async () => {
+    const ip = makeTestIp()
+    const limitedApp = createApp({
+      trustProxy: 1,
+      rateLimits: {
+        api: { limit: 100, windowSeconds: 60 },
+        register: { limit: 1, windowSeconds: 60 },
+      },
+    })
+
+    try {
+      expect(
+        (
+          await request(limitedApp)
+            .post('/api/v1/auth/register')
+            .set('x-forwarded-for', ip)
+            .send(makeRegistration())
+        ).status,
+      ).toBe(201)
+      const limited = await request(limitedApp)
+        .post('/api/v1/auth/register')
+        .set('x-forwarded-for', ip)
+        .send(makeRegistration())
+
+      expect(limited.status).toBe(429)
+      expect(Number(limited.headers['retry-after'])).toBeGreaterThan(0)
+    } finally {
+      await redis.del(`rate-limit:api:${ip}`, `rate-limit:register:${ip}`)
+    }
+  })
+
+  it('applies the general API limit to all versioned routes', async () => {
+    const ip = makeTestIp()
+    const limitedApp = createApp({
+      trustProxy: 1,
+      rateLimits: {
+        api: { limit: 1, windowSeconds: 60 },
+      },
+    })
+
+    try {
+      const unauthenticated = await request(limitedApp)
+        .get('/api/v1/users/me')
+        .set('x-forwarded-for', ip)
+      expect(unauthenticated.status).toBe(401)
+
+      const limited = await request(limitedApp).get('/api/v1/users/me').set('x-forwarded-for', ip)
+      expect(limited.status).toBe(429)
+      expect(Number(limited.headers['retry-after'])).toBeGreaterThan(0)
+    } finally {
+      await redis.del(`rate-limit:api:${ip}`)
+    }
+  })
+
+  it('locks an account after five failed passwords, including a correct sixth attempt', async () => {
+    const registration = makeRegistration()
+    await request(app).post('/api/v1/auth/register').send(registration).expect(201)
+
+    const ip = makeTestIp()
+    const limitedApp = createApp({
+      trustProxy: 1,
+      rateLimits: {
+        api: { limit: 100, windowSeconds: 60 },
+        login: { limit: 100, windowSeconds: 60 },
+      },
+    })
+    const login = (password: string) =>
+      request(limitedApp)
+        .post('/api/v1/auth/login')
+        .set('x-forwarded-for', ip)
+        .send({ email: registration.email, password })
+
+    try {
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        expect((await login('WrongPassword123!')).status).toBe(401)
+      }
+
+      const fifthFailure = await login('WrongPassword123!')
+      expect(fifthFailure.status).toBe(429)
+      expect(fifthFailure.body.error.code).toBe('RATE_LIMITED')
+      expect(Number(fifthFailure.headers['retry-after'])).toBeGreaterThan(0)
+
+      const correctSixthAttempt = await login(registration.password)
+      expect(correctSixthAttempt.status).toBe(429)
+      expect(correctSixthAttempt.body.error.code).toBe('RATE_LIMITED')
+    } finally {
+      await redis.del(
+        `login:fail:${registration.email}`,
+        `rate-limit:api:${ip}`,
+        `rate-limit:login:${ip}`,
+      )
+    }
+  })
+
+  it('clears the failed-login counter on successful login', async () => {
+    const registration = makeRegistration()
+    await request(app).post('/api/v1/auth/register').send(registration).expect(201)
+
+    const ip = makeTestIp()
+    const limitedApp = createApp({
+      trustProxy: 1,
+      rateLimits: {
+        api: { limit: 100, windowSeconds: 60 },
+        login: { limit: 100, windowSeconds: 60 },
+      },
+    })
+    const failureKey = `login:fail:${registration.email}`
+    const login = (password: string) =>
+      request(limitedApp)
+        .post('/api/v1/auth/login')
+        .set('x-forwarded-for', ip)
+        .send({ email: registration.email, password })
+
+    try {
+      expect((await login('WrongPassword123!')).status).toBe(401)
+      expect((await login('WrongPassword123!')).status).toBe(401)
+      expect(await redis.get(failureKey)).toBe('2')
+
+      expect((await login(registration.password)).status).toBe(200)
+      expect(await redis.get(failureKey)).toBeNull()
+
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        expect((await login('WrongPassword123!')).status).toBe(401)
+      }
+      expect((await login('WrongPassword123!')).status).toBe(429)
+    } finally {
+      await redis.del(failureKey, `rate-limit:api:${ip}`, `rate-limit:login:${ip}`)
+    }
   })
 
   it('rotates tokens, tolerates a grace-period replay, and logs out', async () => {
