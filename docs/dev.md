@@ -8,4 +8,4 @@ To connect the socket CLI, set `API_URL` to the REST API base URL (default `http
 API_URL=http://localhost:3000/api/v1 EMAIL=ada@example.com PASSWORD='your-password' pnpm exec tsx scripts/socket-cli.ts
 ```
 
-The CLI logs every server event and accepts `help`, `reconnect`, and `quit`. Future realtime tasks add message commands.
+The CLI logs every server event and accepts `send <conversationId> <text>`, `help`, `reconnect`, and `quit`.

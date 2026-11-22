@@ -7,7 +7,12 @@ import { env } from '../config/env.js'
 import { logger } from '../infra/logger.js'
 import { prisma } from '../infra/prisma.js'
 import { authenticateAccessToken } from '../modules/auth/access.js'
+import { MessagesService } from '../modules/messages/messages.service.js'
+import { RateLimitedError } from '../http/errors/index.js'
+import { rateLimit } from '../infra/rateLimit.js'
+import { SendMessageInput } from '@realtime-messaging/contracts'
 import { installSocketAuth } from './auth.js'
+import { handle } from './handler.js'
 import type { RealtimeServer, RealtimeSocket, SocketData } from './types.js'
 import type { ClientToServerEvents, ServerToClientEvents } from '@realtime-messaging/contracts'
 
@@ -34,6 +39,7 @@ export function createRealtimeServer(
   )
 
   installSocketAuth(io, dependencies.authenticate ?? authenticateAccessToken)
+  const messages = new MessagesService()
   io.on('connection', (socket) => {
     const expiryTime = socket.data.tokenExp * 1000
     let expiryTimer: NodeJS.Timeout | undefined
@@ -60,6 +66,25 @@ export function createRealtimeServer(
         'Failed to initialize socket connection',
       )
       socket.disconnect(true)
+    })
+
+    handle(socket, 'message:send', SendMessageInput, async (input) => {
+      const rateLimitResult = await rateLimit({
+        key: `rl:sock:${socket.data.userId}:message:send`,
+        limit: 20,
+        windowSeconds: 10,
+      })
+      if (!rateLimitResult.allowed) {
+        const retryAfterMs = rateLimitResult.retryAfterSeconds * 1000
+        socket.emit('rate_limited', { event: 'message:send', retryAfterMs })
+        throw new RateLimitedError('Too many requests', rateLimitResult.retryAfterSeconds)
+      }
+
+      const result = await messages.sendMessage(socket.data.userId, input)
+      if (!result.duplicate) {
+        io.to(`conv:${input.conversationId}`).emit('message:new', { message: result.message })
+      }
+      return result
     })
   })
 
