@@ -1,0 +1,18 @@
+@baseUrl = http://localhost:3000/api/v1
+@accessToken = paste-access-token-here
+@userId = paste-user-id-here
+@conversationId = paste-conversation-id-here
+
+### Open or create a direct conversation
+POST {{baseUrl}}/conversations
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+
+{
+  "type": "DIRECT",
+  "userId": "{{userId}}"
+}
+
+### Get a conversation (members only)
+GET {{baseUrl}}/conversations/{{conversationId}}
+Authorization: Bearer {{accessToken}}

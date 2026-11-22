@@ -277,7 +277,9 @@ describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
       .set('authorization', `Bearer ${auth.accessToken}`)
       .send({ avatarUrl: null })
       .expect(200)
-    expect((await prisma.user.findUniqueOrThrow({ where: { id: auth.user.id } })).avatarUrl).toBeNull()
+    expect(
+      (await prisma.user.findUniqueOrThrow({ where: { id: auth.user.id } })).avatarUrl,
+    ).toBeNull()
 
     const missingFields = await request(app)
       .patch('/api/v1/users/me')
@@ -401,6 +403,114 @@ describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
       'UNAUTHENTICATED',
       'UNAUTHENTICATED',
     ])
+  })
+
+  it('creates one direct conversation for either participant order', async () => {
+    const alice = await createRegisteredSession({ displayName: 'Alice' })
+    const bob = await createRegisteredSession({ displayName: 'Bob' })
+    const createConversation = (accessToken: string, userId: string) =>
+      request(app)
+        .post('/api/v1/conversations')
+        .set('authorization', `Bearer ${accessToken}`)
+        .send({ type: 'DIRECT', userId })
+
+    const created = await createConversation(alice.auth.accessToken, bob.auth.user.id).expect(201)
+    expect(created.body).toMatchObject({
+      type: 'DIRECT',
+      name: null,
+      lastSeq: 0,
+      lastMessage: null,
+      unreadCount: 0,
+      myLastReadSeq: 0,
+      peerPresence: null,
+    })
+    expect(created.body.members).toHaveLength(2)
+    expect(created.body.members.map((member: { userId: string }) => member.userId).sort()).toEqual(
+      [alice.auth.user.id, bob.auth.user.id].sort(),
+    )
+
+    const directKey = [alice.auth.user.id, bob.auth.user.id].sort().join(':')
+    const conversation = await prisma.conversation.findUniqueOrThrow({ where: { directKey } })
+    expect(conversation.lastMessageAt).not.toBeNull()
+    const participants = await prisma.participant.findMany({
+      where: { conversationId: conversation.id },
+    })
+    expect(participants).toHaveLength(2)
+    expect(
+      participants.every(
+        (participant) => participant.lastDeliveredSeq === 0 && participant.lastReadSeq === 0,
+      ),
+    ).toBe(true)
+
+    const openedInReverse = await createConversation(
+      bob.auth.accessToken,
+      alice.auth.user.id,
+    ).expect(200)
+    expect(openedInReverse.body.id).toBe(created.body.id)
+    expect(await prisma.conversation.count()).toBe(1)
+  })
+
+  it('handles twenty concurrent opens of the same direct conversation', async () => {
+    const alice = await createRegisteredSession()
+    const bob = await createRegisteredSession()
+    const responses = await Promise.all(
+      Array.from({ length: 20 }, () =>
+        request(app)
+          .post('/api/v1/conversations')
+          .set('authorization', `Bearer ${alice.auth.accessToken}`)
+          .send({ type: 'DIRECT', userId: bob.auth.user.id }),
+      ),
+    )
+
+    expect(responses.filter((response) => response.status === 201)).toHaveLength(1)
+    expect(responses.filter((response) => response.status === 200)).toHaveLength(19)
+    expect(new Set(responses.map((response) => response.body.id)).size).toBe(1)
+    expect(await prisma.conversation.count()).toBe(1)
+    expect(await prisma.participant.count()).toBe(2)
+  })
+
+  it('rejects self conversations and unknown target users', async () => {
+    const alice = await createRegisteredSession()
+
+    const self = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${alice.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: alice.auth.user.id })
+    expect(self.status).toBe(400)
+    expect(self.body.error.code).toBe('VALIDATION_ERROR')
+
+    const unknownUser = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${alice.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: randomUUID() })
+    expect(unknownUser.status).toBe(404)
+    expect(unknownUser.body.error.code).toBe('NOT_FOUND')
+  })
+
+  it('returns conversation details only to active members', async () => {
+    const alice = await createRegisteredSession()
+    const bob = await createRegisteredSession()
+    const charlie = await createRegisteredSession()
+    const created = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${alice.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: bob.auth.user.id })
+      .expect(201)
+
+    await request(app)
+      .get(`/api/v1/conversations/${created.body.id}`)
+      .set('authorization', `Bearer ${bob.auth.accessToken}`)
+      .expect(200)
+
+    const nonMember = await request(app)
+      .get(`/api/v1/conversations/${created.body.id}`)
+      .set('authorization', `Bearer ${charlie.auth.accessToken}`)
+    expect(nonMember.status).toBe(404)
+    expect(nonMember.body.error.code).toBe('NOT_FOUND')
+
+    const unauthenticated = await request(app).get(`/api/v1/conversations/${created.body.id}`)
+    expect(unauthenticated.status).toBe(401)
+    expect(unauthenticated.body.error.code).toBe('UNAUTHENTICATED')
   })
 
   it('returns TOKEN_EXPIRED for an expired access token', async () => {

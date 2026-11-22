@@ -3,6 +3,8 @@ import { z } from 'zod'
 
 import {
   AuthResponse,
+  ConversationDto,
+  CreateConversationBody,
   ErrorCode,
   ErrorEnvelope,
   IdSchema,
@@ -112,9 +114,9 @@ describe('shared contracts', () => {
     })
     expect(UpdateProfileBody.parse({ avatarUrl: null })).toEqual({ avatarUrl: null })
     expect(UpdateProfileBody.safeParse({}).success).toBe(false)
-    expect(UpdateProfileBody.safeParse({ avatarUrl: 'http://example.com/avatar.png' }).success).toBe(
-      false,
-    )
+    expect(
+      UpdateProfileBody.safeParse({ avatarUrl: 'http://example.com/avatar.png' }).success,
+    ).toBe(false)
     expect(
       UpdateProfileBody.safeParse({ avatarUrl: `https://${'a'.repeat(500)}.com` }).success,
     ).toBe(false)
@@ -123,6 +125,38 @@ describe('shared contracts', () => {
     expect(UserSearchQuery.parse({ q: 'Ada', limit: '20' })).toEqual({ q: 'Ada', limit: 20 })
     expect(UserSearchQuery.safeParse({ q: 'A' }).success).toBe(false)
     expect(UserSearchQuery.safeParse({ q: 'Ada', limit: 21 }).success).toBe(false)
+  })
+
+  it('validates direct conversation requests and DTOs', () => {
+    expect(CreateConversationBody.parse({ type: 'DIRECT', userId: 'user-123' })).toEqual({
+      type: 'DIRECT',
+      userId: 'user-123',
+    })
+    expect(CreateConversationBody.safeParse({ type: 'DIRECT' }).success).toBe(false)
+    expect(
+      CreateConversationBody.safeParse({ type: 'GROUP', name: 'Group', memberIds: [] }).success,
+    ).toBe(false)
+
+    expect(
+      ConversationDto.parse({
+        id: 'conversation-1',
+        type: 'DIRECT',
+        name: null,
+        members: [
+          {
+            userId: 'user-123',
+            role: 'MEMBER',
+            displayName: 'Ada',
+            avatarUrl: null,
+          },
+        ],
+        lastSeq: 0,
+        lastMessage: null,
+        unreadCount: 0,
+        myLastReadSeq: 0,
+        peerPresence: null,
+      }).type,
+    ).toBe('DIRECT')
   })
 
   it('can be composed with package schemas', () => {
