@@ -75,14 +75,16 @@ jobs:
       - name: Typecheck
         run: pnpm typecheck
 
-      - name: Create test database
+      - name: Create test databases
         run: |
           PGPASSWORD=messaging_dev psql -h localhost -U messaging -d messaging -c 'CREATE DATABASE chat_test;'
+          PGPASSWORD=messaging_dev psql -h localhost -U messaging -d messaging -c 'CREATE DATABASE chat_worker_test;'
 
       - name: Apply migrations
         run: |
           pnpm db:deploy
           DATABASE_URL="$DATABASE_URL_TEST" pnpm db:deploy
+          DATABASE_URL=postgresql://messaging:messaging_dev@localhost:5432/chat_worker_test pnpm db:deploy
 
       - name: Test
         run: pnpm test
