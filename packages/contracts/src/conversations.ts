@@ -1,0 +1,59 @@
+import { z } from 'zod'
+
+import { IdSchema, IsoDateSchema } from './common.js'
+
+const DirectCreateConversationBody = z.object({
+  type: z.literal('DIRECT'),
+  userId: IdSchema,
+})
+
+export const CreateConversationBody = z.discriminatedUnion('type', [DirectCreateConversationBody])
+
+export type CreateConversationBody = z.infer<typeof CreateConversationBody>
+
+export const MessageDto = z.object({
+  id: IdSchema,
+  conversationId: IdSchema,
+  seq: z.number().int(),
+  senderId: IdSchema.nullable(),
+  type: z.enum(['TEXT', 'SYSTEM']),
+  content: z.string().nullable(),
+  clientMessageId: z.string().uuid(),
+  replyTo: z
+    .object({
+      id: IdSchema,
+      senderId: IdSchema.nullable(),
+      preview: z.string(),
+    })
+    .nullable(),
+  createdAt: IsoDateSchema,
+  deletedAt: IsoDateSchema.nullable(),
+})
+
+export type MessageDto = z.infer<typeof MessageDto>
+
+export const ConversationDto = z.object({
+  id: IdSchema,
+  type: z.enum(['DIRECT', 'GROUP']),
+  name: z.string().nullable(),
+  members: z.array(
+    z.object({
+      userId: IdSchema,
+      role: z.enum(['OWNER', 'ADMIN', 'MEMBER']),
+      displayName: z.string(),
+      avatarUrl: z.string().nullable(),
+    }),
+  ),
+  lastSeq: z.number().int(),
+  lastMessage: MessageDto.nullable(),
+  unreadCount: z.number().int(),
+  myLastReadSeq: z.number().int(),
+  peerPresence: z
+    .object({
+      online: z.boolean(),
+      lastSeenAt: IsoDateSchema.nullable(),
+    })
+    .nullable(),
+})
+
+export type ConversationDto = z.infer<typeof ConversationDto>

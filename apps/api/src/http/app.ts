@@ -13,6 +13,7 @@ import healthRouter from './routes/health.js'
 import readyRouter from './routes/ready.js'
 import { createAuthRouter } from './routes/auth.js'
 import usersRouter from './routes/users.js'
+import conversationsRouter from './routes/conversations.js'
 import type { RateLimitPolicy } from '../infra/rateLimit.js'
 
 export type AppOptions = {
@@ -100,6 +101,7 @@ export function createApp(options: AppOptions = {}): Express {
     }),
   )
   app.use('/api/v1', usersRouter)
+  app.use('/api/v1', conversationsRouter)
   // Error handling (must remain last)
   app.use(notFoundHandler)
   app.use(errorHandler)
