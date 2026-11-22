@@ -1,11 +1,14 @@
 import { randomUUID } from 'node:crypto'
+import { createServer } from 'node:http'
 import { PrismaClient } from '@prisma/client'
 import argon2 from 'argon2'
 import { jwtVerify, SignJWT } from 'jose'
+import { io as createSocketClient, type Socket as ClientSocket } from 'socket.io-client'
 import request from 'supertest'
-import { afterAll, beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
 import { AuthResponse } from '@realtime-messaging/contracts'
+import type { ClientToServerEvents, ServerToClientEvents } from '@realtime-messaging/contracts'
 import { env } from '../../src/config/env.js'
 import { createApp } from '../../src/http/app.js'
 import { prisma as apiPrisma } from '../../src/infra/prisma.js'
@@ -13,17 +16,28 @@ import { redis } from '../../src/infra/redis.js'
 import { REFRESH_COOKIE_NAME } from '../../src/modules/auth/cookies.js'
 import { hashRefreshToken, signAccessToken } from '../../src/modules/auth/tokens.js'
 import { revokedSessionKey } from '../../src/modules/auth/sessions.js'
+import { createRealtimeServer } from '../../src/realtime/server.js'
+import { SocketGateway } from '../../src/realtime/socketGateway.js'
 import { disconnectDb, resetDb } from '../helpers/db.js'
 
+type TestSocket = ClientSocket<ServerToClientEvents, ClientToServerEvents>
+
+const socketGateway = new SocketGateway()
 const app = createApp({
+  gateway: socketGateway,
   rateLimits: {
     api: { limit: 1000, windowSeconds: 60 },
     register: { limit: 1000, windowSeconds: 60 },
     login: { limit: 1000, windowSeconds: 60 },
   },
 })
+const realtimeHttpServer = createServer(app)
+const realtimeServer = createRealtimeServer(realtimeHttpServer)
+socketGateway.attach(realtimeServer)
 const prisma = new PrismaClient()
 const observedQueries: string[] = []
+const socketClients = new Set<TestSocket>()
+let socketUrl: string
 
 apiPrisma.$on('query', ({ query }) => observedQueries.push(query))
 
@@ -53,6 +67,33 @@ function getRefreshToken(response: { headers: { 'set-cookie'?: string[] } }): st
   return token
 }
 
+function connectSocket(token?: string): TestSocket {
+  const socket = createSocketClient(socketUrl, {
+    auth: token === undefined ? {} : { token },
+    autoConnect: false,
+    reconnection: false,
+    timeout: 5000,
+  }) as TestSocket
+  socketClients.add(socket)
+  return socket
+}
+
+function waitForReady(socket: TestSocket): Promise<{ serverTime: string }> {
+  return new Promise((resolve, reject) => {
+    socket.once('ready', resolve)
+    socket.once('connect_error', reject)
+    socket.connect()
+  })
+}
+
+function waitForConnectError(socket: TestSocket): Promise<string> {
+  return new Promise((resolve, reject) => {
+    socket.once('connect_error', (error) => resolve(error.message))
+    socket.once('connect', () => reject(new Error('Expected the socket connection to fail')))
+    socket.connect()
+  })
+}
+
 async function createRegisteredSession(
   overrides: Partial<ReturnType<typeof makeRegistration>> = {},
 ) {
@@ -67,11 +108,31 @@ async function createRegisteredSession(
 }
 
 describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
+  beforeAll(async () => {
+    await new Promise<void>((resolve, reject) => {
+      realtimeHttpServer.once('error', reject)
+      realtimeHttpServer.listen(0, '127.0.0.1', resolve)
+    })
+    const address = realtimeHttpServer.address()
+    if (!address || typeof address === 'string') {
+      throw new Error('Socket test server did not bind to a TCP port')
+    }
+    socketUrl = `http://127.0.0.1:${address.port}`
+  })
+
   beforeEach(async () => {
     await resetDb()
   })
 
+  afterEach(() => {
+    for (const socket of socketClients) {
+      socket.disconnect()
+    }
+    socketClients.clear()
+  })
+
   afterAll(async () => {
+    await new Promise<void>((resolve) => realtimeServer.close(() => resolve()))
     await disconnectDb()
     await prisma.$disconnect()
   })
@@ -1433,6 +1494,102 @@ describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
     const tooMany = await request(app).get(`${path}?limit=101`).set(headers)
     expect(tooMany.status).toBe(400)
     expect(tooMany.body.error.code).toBe('VALIDATION_ERROR')
+  })
+
+  it('authenticates sockets and joins the user and active conversation rooms', async () => {
+    const viewer = await createRegisteredSession()
+    const peer = await createRegisteredSession()
+    const conversation = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${viewer.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: peer.auth.user.id })
+      .expect(201)
+
+    const socket = connectSocket(viewer.auth.accessToken)
+    const ready = await waitForReady(socket)
+    expect(new Date(ready.serverTime).toISOString()).toBe(ready.serverTime)
+
+    const userSockets = await realtimeServer.in(`user:${viewer.auth.user.id}`).fetchSockets()
+    expect(userSockets.map(({ id }) => id)).toContain(socket.id)
+    expect(userSockets[0]?.rooms.has(`conv:${conversation.body.id}`)).toBe(true)
+
+    const conversationSockets = await realtimeServer
+      .in(`conv:${conversation.body.id}`)
+      .fetchSockets()
+    expect(conversationSockets.map(({ id }) => id)).toContain(socket.id)
+  })
+
+  it('rejects missing, invalid, expired, and revoked socket tokens', async () => {
+    const viewer = await createRegisteredSession()
+    const now = Math.floor(Date.now() / 1000)
+    const expiredToken = await new SignJWT({ sid: randomUUID() })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setSubject(viewer.auth.user.id)
+      .setIssuedAt(now - 120)
+      .setExpirationTime(now - 60)
+      .sign(new TextEncoder().encode(env.JWT_ACCESS_SECRET))
+    const revokedSessionId = randomUUID()
+    const revokedToken = await signAccessToken({
+      userId: viewer.auth.user.id,
+      sessionId: revokedSessionId,
+    })
+    await redis.set(revokedSessionKey(revokedSessionId), '1', 'EX', 60)
+
+    expect(await waitForConnectError(connectSocket())).toBe('UNAUTHENTICATED')
+    expect(await waitForConnectError(connectSocket('not-a-token'))).toBe('UNAUTHENTICATED')
+    expect(await waitForConnectError(connectSocket(expiredToken))).toBe('TOKEN_EXPIRED')
+    expect(await waitForConnectError(connectSocket(revokedToken))).toBe('UNAUTHENTICATED')
+  })
+
+  it('disconnects an authenticated socket when its access token expires', async () => {
+    const viewer = await createRegisteredSession()
+    const expiry = Math.floor(Date.now() / 1000) + 2
+    const token = await new SignJWT({ sid: randomUUID() })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setSubject(viewer.auth.user.id)
+      .setIssuedAt()
+      .setExpirationTime(expiry)
+      .sign(new TextEncoder().encode(env.JWT_ACCESS_SECRET))
+    const socket = connectSocket(token)
+    const disconnected = new Promise<void>((resolve) => {
+      socket.once('disconnect', () => resolve())
+    })
+
+    await waitForReady(socket)
+    await disconnected
+    expect(socket.connected).toBe(false)
+  })
+
+  it('joins live group members to the room and removes them when their access ends', async () => {
+    const owner = await createRegisteredSession()
+    const member = await createRegisteredSession()
+    const socket = connectSocket(member.auth.accessToken)
+    await waitForReady(socket)
+
+    const createdEvent = new Promise<{ conversation: { id: string } }>((resolve) => {
+      socket.once('conversation:created', resolve)
+    })
+    const group = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .send({ type: 'GROUP', name: 'Live group', memberIds: [member.auth.user.id] })
+      .expect(201)
+    expect((await createdEvent).conversation.id).toBe(group.body.id)
+
+    const groupSockets = await realtimeServer.in(`conv:${group.body.id}`).fetchSockets()
+    expect(groupSockets.map(({ id }) => id)).toContain(socket.id)
+
+    const removedEvent = new Promise<{ conversationId: string }>((resolve) => {
+      socket.once('conversation:removed', resolve)
+    })
+    await request(app)
+      .delete(`/api/v1/conversations/${group.body.id}/members/${member.auth.user.id}`)
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .expect(204)
+    expect(await removedEvent).toEqual({ conversationId: group.body.id })
+
+    const remainingSockets = await realtimeServer.in(`conv:${group.body.id}`).fetchSockets()
+    expect(remainingSockets.map(({ id }) => id)).not.toContain(socket.id)
   })
 
   it('returns TOKEN_EXPIRED for an expired access token', async () => {
