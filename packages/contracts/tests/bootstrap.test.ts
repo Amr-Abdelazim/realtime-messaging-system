@@ -3,6 +3,7 @@ import { z } from 'zod'
 
 import {
   AuthResponse,
+  AddConversationMembersBody,
   ConversationDto,
   CreateConversationBody,
   ErrorCode,
@@ -12,6 +13,7 @@ import {
   LoginBody,
   PaginationQuery,
   RegisterBody,
+  UpdateConversationBody,
   UpdateProfileBody,
   UserSearchQuery,
 } from '../src/index.js'
@@ -134,8 +136,23 @@ describe('shared contracts', () => {
     })
     expect(CreateConversationBody.safeParse({ type: 'DIRECT' }).success).toBe(false)
     expect(
-      CreateConversationBody.safeParse({ type: 'GROUP', name: 'Group', memberIds: [] }).success,
+      CreateConversationBody.parse({
+        type: 'GROUP',
+        name: '  Group  ',
+        memberIds: ['user-123', 'user-456'],
+      }),
+    ).toEqual({
+      type: 'GROUP',
+      name: 'Group',
+      memberIds: ['user-123', 'user-456'],
+    })
+    expect(
+      CreateConversationBody.safeParse({ type: 'GROUP', name: ' ', memberIds: [] }).success,
     ).toBe(false)
+    expect(UpdateConversationBody.parse({ name: '  New name  ' })).toEqual({ name: 'New name' })
+    expect(AddConversationMembersBody.parse({ userIds: ['user-123'] })).toEqual({
+      userIds: ['user-123'],
+    })
 
     expect(
       ConversationDto.parse({

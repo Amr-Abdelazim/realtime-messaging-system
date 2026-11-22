@@ -106,6 +106,7 @@ model Message {
   type            MessageType   @default(TEXT)
   content         String        @db.VarChar(4000)
   clientMessageId String
+  metadata        Json?
   replyToId       String?
   replyTo         Message?      @relation("Replies", fields: [replyToId], references: [id], onDelete: SetNull)
   replies         Message[]     @relation("Replies")

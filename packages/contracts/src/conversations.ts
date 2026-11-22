@@ -7,9 +7,30 @@ const DirectCreateConversationBody = z.object({
   userId: IdSchema,
 })
 
-export const CreateConversationBody = z.discriminatedUnion('type', [DirectCreateConversationBody])
+const GroupCreateConversationBody = z.object({
+  type: z.literal('GROUP'),
+  name: z.string().trim().min(1).max(100),
+  memberIds: z.array(IdSchema),
+})
+
+export const CreateConversationBody = z.discriminatedUnion('type', [
+  DirectCreateConversationBody,
+  GroupCreateConversationBody,
+])
 
 export type CreateConversationBody = z.infer<typeof CreateConversationBody>
+
+export const UpdateConversationBody = z.object({
+  name: z.string().trim().min(1).max(100),
+})
+
+export type UpdateConversationBody = z.infer<typeof UpdateConversationBody>
+
+export const AddConversationMembersBody = z.object({
+  userIds: z.array(IdSchema).min(1),
+})
+
+export type AddConversationMembersBody = z.infer<typeof AddConversationMembersBody>
 
 export const MessageDto = z.object({
   id: IdSchema,

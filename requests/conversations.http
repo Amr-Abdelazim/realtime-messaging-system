@@ -1,6 +1,7 @@
 @baseUrl = http://localhost:3000/api/v1
 @accessToken = paste-access-token-here
 @userId = paste-user-id-here
+@secondUserId = paste-second-user-id-here
 @conversationId = paste-conversation-id-here
 
 ### Open or create a direct conversation
@@ -13,6 +14,43 @@ Content-Type: application/json
   "userId": "{{userId}}"
 }
 
+### Create a group conversation
+POST {{baseUrl}}/conversations
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+
+{
+  "type": "GROUP",
+  "name": "Project Team",
+  "memberIds": ["{{userId}}", "{{secondUserId}}"]
+}
+
 ### Get a conversation (members only)
 GET {{baseUrl}}/conversations/{{conversationId}}
+Authorization: Bearer {{accessToken}}
+
+### Rename a group
+PATCH {{baseUrl}}/conversations/{{conversationId}}
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+
+{
+  "name": "New Project Team Name"
+}
+
+### Add members to a group
+POST {{baseUrl}}/conversations/{{conversationId}}/members
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+
+{
+  "userIds": ["{{secondUserId}}"]
+}
+
+### Remove a member or remove yourself
+DELETE {{baseUrl}}/conversations/{{conversationId}}/members/{{secondUserId}}
+Authorization: Bearer {{accessToken}}
+
+### Leave a group
+POST {{baseUrl}}/conversations/{{conversationId}}/leave
 Authorization: Bearer {{accessToken}}
