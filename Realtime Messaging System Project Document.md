@@ -305,6 +305,7 @@ model Message {
   type            MessageType  @default(TEXT)
   content         String       @db.VarChar(4000)
   clientMessageId String                        // client generated UUID, idempotency key
+  metadata        Json?                         // internal metadata for system messages
   replyToId       String?
   replyTo         Message?     @relation("Replies", fields: [replyToId], references: [id], onDelete: SetNull)
   replies         Message[]    @relation("Replies")

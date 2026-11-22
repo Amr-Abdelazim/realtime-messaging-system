@@ -13,8 +13,9 @@ import healthRouter from './routes/health.js'
 import readyRouter from './routes/ready.js'
 import { createAuthRouter } from './routes/auth.js'
 import usersRouter from './routes/users.js'
-import conversationsRouter from './routes/conversations.js'
+import { createConversationsRouter } from './routes/conversations.js'
 import type { RateLimitPolicy } from '../infra/rateLimit.js'
+import type { RealtimeGateway } from '../realtime/gateway.js'
 
 export type AppOptions = {
   trustProxy?: number
@@ -24,6 +25,7 @@ export type AppOptions = {
     login?: RateLimitPolicy
     loginFailures?: RateLimitPolicy
   }
+  gateway?: RealtimeGateway
 }
 
 const defaultRateLimits = {
@@ -101,7 +103,7 @@ export function createApp(options: AppOptions = {}): Express {
     }),
   )
   app.use('/api/v1', usersRouter)
-  app.use('/api/v1', conversationsRouter)
+  app.use('/api/v1', createConversationsRouter(options.gateway))
   // Error handling (must remain last)
   app.use(notFoundHandler)
   app.use(errorHandler)

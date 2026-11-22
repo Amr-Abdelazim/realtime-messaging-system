@@ -513,6 +513,586 @@ describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
     expect(unauthenticated.body.error.code).toBe('UNAUTHENTICATED')
   })
 
+  it('creates groups with deduplicated members, owner role, and an initial system message', async () => {
+    const owner = await createRegisteredSession({ displayName: 'Group Owner' })
+    const firstMember = await createRegisteredSession({ displayName: 'First Member' })
+    const secondMember = await createRegisteredSession({ displayName: 'Second Member' })
+
+    const created = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .send({
+        type: 'GROUP',
+        name: '  Project Team  ',
+        memberIds: [
+          owner.auth.user.id,
+          firstMember.auth.user.id,
+          firstMember.auth.user.id,
+          secondMember.auth.user.id,
+        ],
+      })
+      .expect(201)
+
+    expect(created.body.name).toBe('Project Team')
+    expect(created.body.members).toHaveLength(3)
+    expect(created.body.lastSeq).toBe(1)
+    expect(created.body.lastMessage).toMatchObject({
+      type: 'SYSTEM',
+      content: 'Group Owner created the group',
+      seq: 1,
+    })
+
+    const participants = await prisma.participant.findMany({
+      where: { conversationId: created.body.id },
+    })
+    expect(participants).toHaveLength(3)
+    expect(
+      participants.find((participant) => participant.userId === owner.auth.user.id)?.role,
+    ).toBe('OWNER')
+    expect(participants.every((participant) => participant.joinedAtSeq === 0)).toBe(true)
+    expect(
+      participants.find((participant) => participant.userId === owner.auth.user.id)?.lastReadSeq,
+    ).toBe(1)
+    expect(
+      participants
+        .filter((participant) => participant.userId !== owner.auth.user.id)
+        .every((participant) => participant.lastReadSeq === 0),
+    ).toBe(true)
+
+    const message = await prisma.message.findFirstOrThrow({
+      where: { conversationId: created.body.id },
+    })
+    expect(message.metadata).toMatchObject({
+      action: 'created',
+      actorId: owner.auth.user.id,
+      memberIds: [firstMember.auth.user.id, secondMember.auth.user.id],
+    })
+
+    const noOtherMembers = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .send({ type: 'GROUP', name: 'Empty group', memberIds: [owner.auth.user.id] })
+    expect(noOtherMembers.status).toBe(400)
+
+    const tooManyMembers = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .send({
+        type: 'GROUP',
+        name: 'Too many members',
+        memberIds: Array.from({ length: 256 }, () => randomUUID()),
+      })
+    expect(tooManyMembers.status).toBe(400)
+
+    const unknownMember = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .send({ type: 'GROUP', name: 'Unknown member', memberIds: [randomUUID()] })
+    expect(unknownMember.status).toBe(404)
+  })
+
+  it('enforces rename permissions and sequences group system messages', async () => {
+    const owner = await createRegisteredSession({ displayName: 'Owner' })
+    const admin = await createRegisteredSession({ displayName: 'Admin' })
+    const member = await createRegisteredSession({ displayName: 'Member' })
+    const outsider = await createRegisteredSession({ displayName: 'Outsider' })
+    const created = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .send({
+        type: 'GROUP',
+        name: 'Initial name',
+        memberIds: [admin.auth.user.id, member.auth.user.id],
+      })
+      .expect(201)
+
+    await prisma.participant.update({
+      where: {
+        conversationId_userId: {
+          conversationId: created.body.id,
+          userId: admin.auth.user.id,
+        },
+      },
+      data: { role: 'ADMIN' },
+    })
+
+    await request(app)
+      .patch(`/api/v1/conversations/${created.body.id}`)
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .send({ name: 'Owner name' })
+      .expect(200)
+    await request(app)
+      .patch(`/api/v1/conversations/${created.body.id}`)
+      .set('authorization', `Bearer ${admin.auth.accessToken}`)
+      .send({ name: 'Admin name' })
+      .expect(200)
+
+    const memberDenied = await request(app)
+      .patch(`/api/v1/conversations/${created.body.id}`)
+      .set('authorization', `Bearer ${member.auth.accessToken}`)
+      .send({ name: 'Member name' })
+    expect(memberDenied.status).toBe(403)
+
+    const outsiderDenied = await request(app)
+      .patch(`/api/v1/conversations/${created.body.id}`)
+      .set('authorization', `Bearer ${outsider.auth.accessToken}`)
+      .send({ name: 'Outsider name' })
+    expect(outsiderDenied.status).toBe(404)
+
+    const direct = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: outsider.auth.user.id })
+      .expect(201)
+    const directRename = await request(app)
+      .patch(`/api/v1/conversations/${direct.body.id}`)
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .send({ name: 'Invalid direct rename' })
+    expect(directRename.status).toBe(400)
+
+    const invalidName = await request(app)
+      .patch(`/api/v1/conversations/${created.body.id}`)
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .send({ name: ' ' })
+    expect(invalidName.status).toBe(400)
+
+    const messages = await prisma.message.findMany({
+      where: { conversationId: created.body.id },
+      orderBy: { seq: 'asc' },
+    })
+    expect(messages.map((message) => message.seq)).toEqual([1, 2, 3])
+    expect(messages.map((message) => message.type)).toEqual(['SYSTEM', 'SYSTEM', 'SYSTEM'])
+    expect(messages.map((message) => message.metadata)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ action: 'created' }),
+        expect.objectContaining({ action: 'renamed', actorId: owner.auth.user.id }),
+        expect.objectContaining({ action: 'renamed', actorId: admin.auth.user.id }),
+      ]),
+    )
+  })
+
+  it('adds and re-adds members with history watermarks and admin permissions', async () => {
+    const owner = await createRegisteredSession({ displayName: 'Owner' })
+    const admin = await createRegisteredSession({ displayName: 'Admin' })
+    const member = await createRegisteredSession({ displayName: 'Member' })
+    const returningMember = await createRegisteredSession({ displayName: 'Returning' })
+    const newMember = await createRegisteredSession({ displayName: 'New Member' })
+    const outsider = await createRegisteredSession({ displayName: 'Outsider' })
+    const created = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .send({
+        type: 'GROUP',
+        name: 'Members',
+        memberIds: [admin.auth.user.id, member.auth.user.id, returningMember.auth.user.id],
+      })
+      .expect(201)
+
+    await prisma.participant.update({
+      where: {
+        conversationId_userId: {
+          conversationId: created.body.id,
+          userId: admin.auth.user.id,
+        },
+      },
+      data: { role: 'ADMIN' },
+    })
+    await prisma.participant.update({
+      where: {
+        conversationId_userId: {
+          conversationId: created.body.id,
+          userId: returningMember.auth.user.id,
+        },
+      },
+      data: { leftAt: new Date() },
+    })
+
+    await request(app)
+      .post(`/api/v1/conversations/${created.body.id}/members`)
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .send({
+        userIds: [
+          owner.auth.user.id,
+          member.auth.user.id,
+          newMember.auth.user.id,
+          newMember.auth.user.id,
+          returningMember.auth.user.id,
+        ],
+      })
+      .expect(200)
+
+    const newParticipant = await prisma.participant.findUniqueOrThrow({
+      where: {
+        conversationId_userId: {
+          conversationId: created.body.id,
+          userId: newMember.auth.user.id,
+        },
+      },
+    })
+    const rejoinedParticipant = await prisma.participant.findUniqueOrThrow({
+      where: {
+        conversationId_userId: {
+          conversationId: created.body.id,
+          userId: returningMember.auth.user.id,
+        },
+      },
+    })
+    expect(newParticipant.joinedAtSeq).toBe(1)
+    expect(newParticipant.lastReadSeq).toBe(1)
+    expect(rejoinedParticipant.leftAt).toBeNull()
+    expect(rejoinedParticipant.joinedAtSeq).toBe(1)
+    expect(
+      (await prisma.conversation.findUniqueOrThrow({ where: { id: created.body.id } })).lastSeq,
+    ).toBe(2)
+
+    await request(app)
+      .post(`/api/v1/conversations/${created.body.id}/members`)
+      .set('authorization', `Bearer ${admin.auth.accessToken}`)
+      .send({ userIds: [member.auth.user.id] })
+      .expect(200)
+    expect(
+      (await prisma.conversation.findUniqueOrThrow({ where: { id: created.body.id } })).lastSeq,
+    ).toBe(2)
+
+    const memberDenied = await request(app)
+      .post(`/api/v1/conversations/${created.body.id}/members`)
+      .set('authorization', `Bearer ${member.auth.accessToken}`)
+      .send({ userIds: [outsider.auth.user.id] })
+    expect(memberDenied.status).toBe(403)
+
+    const outsiderDenied = await request(app)
+      .post(`/api/v1/conversations/${created.body.id}/members`)
+      .set('authorization', `Bearer ${outsider.auth.accessToken}`)
+      .send({ userIds: [newMember.auth.user.id] })
+    expect(outsiderDenied.status).toBe(404)
+
+    const unknownUser = await request(app)
+      .post(`/api/v1/conversations/${created.body.id}/members`)
+      .set('authorization', `Bearer ${admin.auth.accessToken}`)
+      .send({ userIds: [randomUUID()] })
+    expect(unknownUser.status).toBe(404)
+
+    const direct = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: outsider.auth.user.id })
+      .expect(201)
+    const directAdd = await request(app)
+      .post(`/api/v1/conversations/${direct.body.id}/members`)
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .send({ userIds: [member.auth.user.id] })
+    expect(directAdd.status).toBe(400)
+  })
+
+  it('enforces the 256 active-member group limit', async () => {
+    const owner = await createRegisteredSession()
+    const firstMember = await createRegisteredSession()
+    const lastAllowedMember = await createRegisteredSession()
+    const overflowMember = await createRegisteredSession()
+    const created = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .send({
+        type: 'GROUP',
+        name: 'Large group',
+        memberIds: [firstMember.auth.user.id],
+      })
+      .expect(201)
+
+    const seedPrefix = randomUUID().replaceAll('-', '').slice(0, 8)
+    const filler = Array.from({ length: 253 }, (_, index) => {
+      const suffix = String(index).padStart(3, '0')
+      return {
+        email: `fill-${seedPrefix}-${suffix}@example.com`,
+        username: `fill_${seedPrefix}_${suffix}`,
+        passwordHash: 'test-password-hash',
+        displayName: `Filler ${suffix}`,
+      }
+    })
+    await prisma.user.createMany({ data: filler })
+    const fillerUsers = await prisma.user.findMany({
+      where: { email: { in: filler.map((user) => user.email) } },
+      select: { id: true },
+    })
+    await prisma.participant.createMany({
+      data: fillerUsers.map(({ id }) => ({
+        conversationId: created.body.id,
+        userId: id,
+      })),
+    })
+
+    await request(app)
+      .post(`/api/v1/conversations/${created.body.id}/members`)
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .send({ userIds: [lastAllowedMember.auth.user.id] })
+      .expect(200)
+
+    const overflow = await request(app)
+      .post(`/api/v1/conversations/${created.body.id}/members`)
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .send({ userIds: [overflowMember.auth.user.id] })
+    expect(overflow.status).toBe(409)
+    expect(overflow.body.error.code).toBe('CONFLICT')
+    expect(await prisma.participant.count({ where: { conversationId: created.body.id } })).toBe(256)
+  })
+
+  it('enforces member-removal permissions and returns 400 for direct conversations', async () => {
+    const owner = await createRegisteredSession()
+    const admin = await createRegisteredSession()
+    const secondAdmin = await createRegisteredSession()
+    const member = await createRegisteredSession()
+    const secondMember = await createRegisteredSession()
+    const outsider = await createRegisteredSession()
+    const created = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .send({
+        type: 'GROUP',
+        name: 'Removal permissions',
+        memberIds: [
+          admin.auth.user.id,
+          secondAdmin.auth.user.id,
+          member.auth.user.id,
+          secondMember.auth.user.id,
+        ],
+      })
+      .expect(201)
+
+    await prisma.participant.updateMany({
+      where: {
+        conversationId: created.body.id,
+        userId: { in: [admin.auth.user.id, secondAdmin.auth.user.id] },
+      },
+      data: { role: 'ADMIN' },
+    })
+
+    const memberCannotRemoveAdmin = await request(app)
+      .delete(`/api/v1/conversations/${created.body.id}/members/${secondAdmin.auth.user.id}`)
+      .set('authorization', `Bearer ${member.auth.accessToken}`)
+    expect(memberCannotRemoveAdmin.status).toBe(403)
+
+    await request(app)
+      .delete(`/api/v1/conversations/${created.body.id}/members/${secondMember.auth.user.id}`)
+      .set('authorization', `Bearer ${admin.auth.accessToken}`)
+      .expect(204)
+
+    const adminCannotRemoveAdmin = await request(app)
+      .delete(`/api/v1/conversations/${created.body.id}/members/${secondAdmin.auth.user.id}`)
+      .set('authorization', `Bearer ${admin.auth.accessToken}`)
+    expect(adminCannotRemoveAdmin.status).toBe(403)
+
+    const adminCannotRemoveOwner = await request(app)
+      .delete(`/api/v1/conversations/${created.body.id}/members/${owner.auth.user.id}`)
+      .set('authorization', `Bearer ${admin.auth.accessToken}`)
+    expect(adminCannotRemoveOwner.status).toBe(403)
+
+    const outsiderCannotRemoveMember = await request(app)
+      .delete(`/api/v1/conversations/${created.body.id}/members/${secondAdmin.auth.user.id}`)
+      .set('authorization', `Bearer ${outsider.auth.accessToken}`)
+    expect(outsiderCannotRemoveMember.status).toBe(404)
+
+    await request(app)
+      .delete(`/api/v1/conversations/${created.body.id}/members/${secondAdmin.auth.user.id}`)
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .expect(204)
+
+    await request(app)
+      .delete(`/api/v1/conversations/${created.body.id}/members/${member.auth.user.id}`)
+      .set('authorization', `Bearer ${member.auth.accessToken}`)
+      .expect(204)
+
+    const direct = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: outsider.auth.user.id })
+      .expect(201)
+    const directRemoval = await request(app)
+      .delete(`/api/v1/conversations/${direct.body.id}/members/${outsider.auth.user.id}`)
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+    expect(directRemoval.status).toBe(400)
+  })
+
+  it('transfers ownership on leave to the oldest admin or member', async () => {
+    const owner = await createRegisteredSession({ displayName: 'Owner' })
+    const oldestAdmin = await createRegisteredSession({ displayName: 'Oldest Admin' })
+    const newerAdmin = await createRegisteredSession({ displayName: 'Newer Admin' })
+    const member = await createRegisteredSession({ displayName: 'Member' })
+    const outsider = await createRegisteredSession({ displayName: 'Outsider' })
+    const created = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .send({
+        type: 'GROUP',
+        name: 'Ownership',
+        memberIds: [oldestAdmin.auth.user.id, newerAdmin.auth.user.id, member.auth.user.id],
+      })
+      .expect(201)
+    const baseTime = Date.now()
+    await prisma.participant.updateMany({
+      where: {
+        conversationId: created.body.id,
+        userId: { in: [oldestAdmin.auth.user.id, newerAdmin.auth.user.id] },
+      },
+      data: { role: 'ADMIN' },
+    })
+    await prisma.participant.update({
+      where: {
+        conversationId_userId: {
+          conversationId: created.body.id,
+          userId: oldestAdmin.auth.user.id,
+        },
+      },
+      data: { joinedAt: new Date(baseTime - 2_000) },
+    })
+    await prisma.participant.update({
+      where: {
+        conversationId_userId: {
+          conversationId: created.body.id,
+          userId: newerAdmin.auth.user.id,
+        },
+      },
+      data: { joinedAt: new Date(baseTime - 1_000) },
+    })
+
+    await request(app)
+      .post(`/api/v1/conversations/${created.body.id}/leave`)
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .expect(204)
+    const transferredOwner = await prisma.participant.findUniqueOrThrow({
+      where: {
+        conversationId_userId: {
+          conversationId: created.body.id,
+          userId: oldestAdmin.auth.user.id,
+        },
+      },
+    })
+    const formerOwner = await prisma.participant.findUniqueOrThrow({
+      where: {
+        conversationId_userId: {
+          conversationId: created.body.id,
+          userId: owner.auth.user.id,
+        },
+      },
+    })
+    expect(transferredOwner.role).toBe('OWNER')
+    expect(formerOwner.role).toBe('MEMBER')
+    expect(formerOwner.leftAt).not.toBeNull()
+
+    await request(app)
+      .post(`/api/v1/conversations/${created.body.id}/leave`)
+      .set('authorization', `Bearer ${newerAdmin.auth.accessToken}`)
+      .expect(204)
+    const outsiderLeave = await request(app)
+      .post(`/api/v1/conversations/${created.body.id}/leave`)
+      .set('authorization', `Bearer ${outsider.auth.accessToken}`)
+    expect(outsiderLeave.status).toBe(404)
+
+    const noAdminOwner = await createRegisteredSession()
+    const firstMember = await createRegisteredSession()
+    const secondMember = await createRegisteredSession()
+    const noAdminGroup = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${noAdminOwner.auth.accessToken}`)
+      .send({
+        type: 'GROUP',
+        name: 'Member succession',
+        memberIds: [firstMember.auth.user.id, secondMember.auth.user.id],
+      })
+      .expect(201)
+    await prisma.participant.update({
+      where: {
+        conversationId_userId: {
+          conversationId: noAdminGroup.body.id,
+          userId: secondMember.auth.user.id,
+        },
+      },
+      data: { joinedAt: new Date(Date.now() + 1_000) },
+    })
+    await request(app)
+      .post(`/api/v1/conversations/${noAdminGroup.body.id}/leave`)
+      .set('authorization', `Bearer ${noAdminOwner.auth.accessToken}`)
+      .expect(204)
+    expect(
+      (
+        await prisma.participant.findUniqueOrThrow({
+          where: {
+            conversationId_userId: {
+              conversationId: noAdminGroup.body.id,
+              userId: firstMember.auth.user.id,
+            },
+          },
+        })
+      ).role,
+    ).toBe('OWNER')
+
+    const direct = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${noAdminOwner.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: outsider.auth.user.id })
+      .expect(201)
+    const directLeave = await request(app)
+      .post(`/api/v1/conversations/${direct.body.id}/leave`)
+      .set('authorization', `Bearer ${noAdminOwner.auth.accessToken}`)
+    expect(directLeave.status).toBe(400)
+  })
+
+  it('calls the realtime gateway only after a group transaction commits', async () => {
+    const owner = await createRegisteredSession()
+    const member = await createRegisteredSession()
+    const events: string[] = []
+    const gateway = {
+      toUser(userId: string, event: string) {
+        events.push(`user:${userId}:${event}`)
+      },
+      toConversation(conversationId: string, event: string) {
+        events.push(`conversation:${conversationId}:${event}`)
+      },
+      async joinUserToConversation(userId: string, conversationId: string) {
+        const participant = await prisma.participant.findUnique({
+          where: { conversationId_userId: { conversationId, userId } },
+        })
+        expect(participant).not.toBeNull()
+        events.push(`join:${userId}`)
+      },
+      async removeUserFromConversation(userId: string, conversationId: string) {
+        const participant = await prisma.participant.findUnique({
+          where: { conversationId_userId: { conversationId, userId } },
+        })
+        expect(participant?.leftAt).not.toBeNull()
+        events.push(`remove:${userId}`)
+      },
+    }
+    const gatewayApp = createApp({
+      gateway,
+      rateLimits: { api: { limit: 1000, windowSeconds: 60 } },
+    })
+
+    const created = await request(gatewayApp)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .send({ type: 'GROUP', name: 'Gateway', memberIds: [member.auth.user.id] })
+      .expect(201)
+    expect(events).toHaveLength(4)
+    expect(events).toEqual(
+      expect.arrayContaining([
+        `join:${owner.auth.user.id}`,
+        `user:${owner.auth.user.id}:conversation:created`,
+        `join:${member.auth.user.id}`,
+        `user:${member.auth.user.id}:conversation:created`,
+      ]),
+    )
+
+    await request(gatewayApp)
+      .delete(`/api/v1/conversations/${created.body.id}/members/${member.auth.user.id}`)
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .expect(204)
+    expect(events.slice(-3)).toEqual([
+      `remove:${member.auth.user.id}`,
+      `user:${member.auth.user.id}:conversation:removed`,
+      `conversation:${created.body.id}:conversation:updated`,
+    ])
+  })
+
   it('returns TOKEN_EXPIRED for an expired access token', async () => {
     const now = Math.floor(Date.now() / 1000)
     const expiredToken = await new SignJWT({ sid: randomUUID() })
