@@ -1,0 +1,92 @@
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-messaging}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-messaging_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-messaging}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-messaging} -d ${POSTGRES_DB:-messaging}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: build
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-messaging}:${POSTGRES_PASSWORD:-messaging_dev}@postgres:5432/${POSTGRES_DB:-messaging}
+    command: ['pnpm', 'exec', 'prisma', 'migrate', 'deploy']
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: 'no'
+
+  api1:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    env_file: .env
+    environment: &api_environment
+      NODE_ENV: production
+      PORT: 3000
+      TRUST_PROXY: 1
+      INSTANCE_ID: api1
+      DATABASE_URL: postgresql://${POSTGRES_USER:-messaging}:${POSTGRES_PASSWORD:-messaging_dev}@postgres:5432/${POSTGRES_DB:-messaging}
+      DATABASE_URL_TEST: postgresql://${POSTGRES_USER:-messaging}:${POSTGRES_PASSWORD:-messaging_dev}@postgres:5432/chat_test
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  api2:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    env_file: .env
+    environment:
+      <<: *api_environment
+      INSTANCE_ID: api2
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - '8080:80'
+    volumes:
+      - ./infra/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api1
+      - api2
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:

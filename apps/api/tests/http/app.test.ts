@@ -7,6 +7,7 @@ import { createApp } from '../../src/http/app.js'
 import { validate } from '../../src/http/middleware/validate.js'
 import { errorHandler } from '../../src/http/middleware/error-handler.js'
 import { notFoundHandler } from '../../src/http/middleware/not-found.js'
+import { env } from '../../src/config/env.js'
 
 describe('HTTP application', () => {
   const app = createApp()
@@ -17,6 +18,7 @@ describe('HTTP application', () => {
     expect(response.status).toBe(200)
     expect(response.body.status).toBe('ok')
     expect(response.body.uptime).toBeTypeOf('number')
+    expect(response.body.instanceId).toBe(env.INSTANCE_ID)
   })
 
   it('should return 404 for unknown routes', async () => {

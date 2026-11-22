@@ -1,11 +1,14 @@
 import type { Server as HttpServer } from 'node:http'
 
 import type { PrismaClient } from '@prisma/client'
+import { createAdapter } from '@socket.io/redis-adapter'
+import { Redis } from 'ioredis'
 import { Server, type DefaultEventsMap } from 'socket.io'
 
 import { env } from '../config/env.js'
 import { logger } from '../infra/logger.js'
 import { prisma } from '../infra/prisma.js'
+import { redis } from '../infra/redis.js'
 import { authenticateAccessToken } from '../modules/auth/access.js'
 import { MessagesService } from '../modules/messages/messages.service.js'
 import { MessageStatusService } from '../modules/messages/status.service.js'
@@ -27,15 +30,34 @@ import type { ClientToServerEvents, ServerToClientEvents } from '@realtime-messa
 
 const MAX_TIMEOUT = 2_147_483_647
 
+const adapterClients = new WeakMap<RealtimeServer, [Redis, Redis]>()
+
 export type RealtimeServerDependencies = {
   prisma?: Pick<PrismaClient, 'participant'>
   authenticate?: typeof authenticateAccessToken
 }
 
-export function createRealtimeServer(
+export async function createRealtimeServer(
   httpServer: HttpServer,
   dependencies: RealtimeServerDependencies = {},
-): RealtimeServer {
+): Promise<RealtimeServer> {
+  const publisher = redis.duplicate()
+  const subscriber = redis.duplicate()
+  publisher.on('error', (error: Error) => {
+    logger.error({ err: error }, 'Socket.IO Redis publisher error')
+  })
+  subscriber.on('error', (error: Error) => {
+    logger.error({ err: error }, 'Socket.IO Redis subscriber error')
+  })
+
+  try {
+    await Promise.all([waitForRedisReady(publisher), waitForRedisReady(subscriber)])
+  } catch (error) {
+    publisher.disconnect()
+    subscriber.disconnect()
+    throw error
+  }
+
   const allowedOrigins = env.CORS_ORIGINS.split(',').map((origin) => origin.trim())
   const io = new Server<ClientToServerEvents, ServerToClientEvents, DefaultEventsMap, SocketData>(
     httpServer,
@@ -46,6 +68,8 @@ export function createRealtimeServer(
       cors: { origin: allowedOrigins },
     },
   )
+  io.adapter(createAdapter(publisher, subscriber))
+  adapterClients.set(io, [publisher, subscriber])
 
   installSocketAuth(io, dependencies.authenticate ?? authenticateAccessToken)
   const database = dependencies.prisma ?? prisma
@@ -203,6 +227,44 @@ export function createRealtimeServer(
   })
 
   return io
+}
+
+export async function closeRealtimeServer(io: RealtimeServer): Promise<void> {
+  const clients = adapterClients.get(io)
+  if (!clients) {
+    throw new Error('Realtime server Redis clients were not found')
+  }
+
+  await io.close()
+  adapterClients.delete(io)
+  await Promise.all(clients.map((client) => client.quit()))
+}
+
+function waitForRedisReady(client: Redis): Promise<void> {
+  if (client.status === 'ready') {
+    return Promise.resolve()
+  }
+
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      client.off('ready', onReady)
+      client.off('error', onError)
+    }
+    const onReady = () => {
+      cleanup()
+      resolve()
+    }
+    const onError = (error: Error) => {
+      cleanup()
+      reject(error)
+    }
+
+    client.once('ready', onReady)
+    client.once('error', onError)
+    if (client.status === 'wait') {
+      void client.connect().catch(onError)
+    }
+  })
 }
 
 async function initializeConnection(
