@@ -1817,6 +1817,7 @@ describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
     const secondHttpServer = createServer(createApp({ gateway: secondGateway }))
     const secondRealtimeServer = await createRealtimeServer(secondHttpServer)
     secondGateway.attach(secondRealtimeServer)
+    let firstInstanceSocket: TestSocket | undefined
 
     try {
       await new Promise<void>((resolve, reject) => {
@@ -1835,6 +1836,7 @@ describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
 
       const aliceOnline = waitForPresence(bobSocket, alice.auth.user.id, true)
       const aliceSocket = connectSocket(alice.auth.accessToken)
+      firstInstanceSocket = aliceSocket
       await Promise.all([waitForReady(aliceSocket), aliceOnline])
 
       const messageOnBob = new Promise((resolve) => {
@@ -1917,6 +1919,9 @@ describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
       })
     } finally {
       await closeRealtimeServer(secondRealtimeServer)
+      if (firstInstanceSocket) {
+        expect(firstInstanceSocket.connected).toBe(true)
+      }
     }
   })
 

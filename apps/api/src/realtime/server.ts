@@ -9,6 +9,8 @@ import { env } from '../config/env.js'
 import { logger } from '../infra/logger.js'
 import { prisma } from '../infra/prisma.js'
 import { redis } from '../infra/redis.js'
+import { messageSendDuration, messagesSent, socketsConnected } from '../infra/metrics.js'
+import type { InFlightOperations } from '../infra/in-flight-operations.js'
 import { authenticateAccessToken } from '../modules/auth/access.js'
 import { MessagesService } from '../modules/messages/messages.service.js'
 import { MessageStatusService } from '../modules/messages/status.service.js'
@@ -30,11 +32,22 @@ import type { ClientToServerEvents, ServerToClientEvents } from '@realtime-messa
 
 const MAX_TIMEOUT = 2_147_483_647
 
-const adapterClients = new WeakMap<RealtimeServer, [Redis, Redis]>()
+type RealtimeResources = {
+  clients: [Redis, Redis]
+  pendingTasks: Set<Promise<void>>
+  presence: PresenceService
+}
+
+const realtimeResources = new WeakMap<RealtimeServer, RealtimeResources>()
 
 export type RealtimeServerDependencies = {
   prisma?: Pick<PrismaClient, 'participant'>
   authenticate?: typeof authenticateAccessToken
+  operations?: InFlightOperations
+}
+
+export type RealtimeServerCloseOptions = {
+  waitForPendingPresence?: boolean
 }
 
 export async function createRealtimeServer(
@@ -69,7 +82,6 @@ export async function createRealtimeServer(
     },
   )
   io.adapter(createAdapter(publisher, subscriber))
-  adapterClients.set(io, [publisher, subscriber])
 
   installSocketAuth(io, dependencies.authenticate ?? authenticateAccessToken)
   const database = dependencies.prisma ?? prisma
@@ -81,9 +93,28 @@ export async function createRealtimeServer(
   const presence = new PresenceService((userId, lastSeenAt) =>
     broadcastPresence(userId, false, lastSeenAt),
   )
+  const resources: RealtimeResources = {
+    clients: [publisher, subscriber],
+    pendingTasks: new Set(),
+    presence,
+  }
+  realtimeResources.set(io, resources)
   const messages = new MessagesService()
   const messageStatus = new MessageStatusService()
   io.on('connection', (socket) => {
+    const socketLogger = logger.child({ socketId: socket.id, userId: socket.data.userId })
+    const releaseInitialization = dependencies.operations?.begin()
+    if (dependencies.operations && !releaseInitialization) {
+      socket.disconnect(true)
+      return
+    }
+
+    socketsConnected.inc()
+    socketLogger.info('Socket connected')
+    const handlerOptions = {
+      logger: socketLogger,
+      beginOperation: dependencies.operations ? () => dependencies.operations?.begin() : undefined,
+    }
     const expiryTime = socket.data.tokenExp * 1000
     let expiryTimer: NodeJS.Timeout | undefined
 
@@ -96,98 +127,130 @@ export async function createRealtimeServer(
       expiryTimer = setTimeout(disconnectAtExpiry, Math.min(remaining, MAX_TIMEOUT))
     }
 
-    socket.once('disconnect', () => {
+    socket.once('disconnect', (reason) => {
+      socketsConnected.dec()
+      socketLogger.info({ reason }, 'Socket disconnected')
       if (expiryTimer) {
         clearTimeout(expiryTimer)
       }
-      void presence.disconnect(socket.data.userId, socket.id).catch((error: unknown) => {
-        logger.error(
-          { err: error, socketId: socket.id, userId: socket.data.userId },
-          'Failed to update presence after disconnect',
-        )
-      })
+      const releaseCleanup = dependencies.operations?.beginCleanup()
+      const cleanup = presence
+        .disconnect(socket.data.userId, socket.id)
+        .catch((error: unknown) => {
+          socketLogger.error({ err: error }, 'Failed to update presence after disconnect')
+        })
+        .finally(() => releaseCleanup?.())
+      trackTask(resources.pendingTasks, cleanup)
     })
     disconnectAtExpiry()
 
-    void initializeConnection(socket, database, presence, broadcastPresence).catch(
-      (error: unknown) => {
-        logger.error(
-          { err: error, socketId: socket.id, userId: socket.data.userId },
-          'Failed to initialize socket connection',
-        )
+    const initialization = initializeConnection(socket, database, presence, broadcastPresence)
+      .catch((error: unknown) => {
+        socketLogger.error({ err: error }, 'Failed to initialize socket connection')
         socket.disconnect(true)
+      })
+      .finally(() => releaseInitialization?.())
+    trackTask(resources.pendingTasks, initialization)
+
+    handle(
+      socket,
+      'message:send',
+      SendMessageInput,
+      async (input) => {
+        const startedAt = process.hrtime.bigint()
+        try {
+          const rateLimitResult = await rateLimit({
+            key: `rl:sock:${socket.data.userId}:message:send`,
+            limit: 20,
+            windowSeconds: 10,
+          })
+          if (!rateLimitResult.allowed) {
+            const retryAfterMs = rateLimitResult.retryAfterSeconds * 1000
+            socket.emit('rate_limited', { event: 'message:send', retryAfterMs })
+            throw new RateLimitedError('Too many requests', rateLimitResult.retryAfterSeconds)
+          }
+
+          const result = await messages.sendMessage(socket.data.userId, input)
+          if (!result.duplicate) {
+            messagesSent.inc()
+            io.to(`conv:${input.conversationId}`).emit('message:new', { message: result.message })
+          }
+          socket.to(`conv:${input.conversationId}`).emit('typing', {
+            conversationId: input.conversationId,
+            userId: socket.data.userId,
+            isTyping: false,
+          })
+          return result
+        } finally {
+          messageSendDuration.observe(Number(process.hrtime.bigint() - startedAt) / 1_000_000_000)
+        }
       },
+      handlerOptions,
     )
 
-    handle(socket, 'message:send', SendMessageInput, async (input) => {
-      const rateLimitResult = await rateLimit({
-        key: `rl:sock:${socket.data.userId}:message:send`,
-        limit: 20,
-        windowSeconds: 10,
-      })
-      if (!rateLimitResult.allowed) {
-        const retryAfterMs = rateLimitResult.retryAfterSeconds * 1000
-        socket.emit('rate_limited', { event: 'message:send', retryAfterMs })
-        throw new RateLimitedError('Too many requests', rateLimitResult.retryAfterSeconds)
-      }
+    handle(
+      socket,
+      'message:delete',
+      MessageDeleteInput,
+      async (input) => {
+        const result = await messages.deleteMessage(socket.data.userId, input.messageId)
+        if (result.deleted) {
+          io.to(`conv:${result.conversationId}`).emit('message:deleted', {
+            conversationId: result.conversationId,
+            messageId: result.messageId,
+            seq: result.seq,
+          })
+        }
+        return { messageId: result.messageId, seq: result.seq }
+      },
+      handlerOptions,
+    )
 
-      const result = await messages.sendMessage(socket.data.userId, input)
-      if (!result.duplicate) {
-        io.to(`conv:${input.conversationId}`).emit('message:new', { message: result.message })
-      }
-      socket.to(`conv:${input.conversationId}`).emit('typing', {
-        conversationId: input.conversationId,
-        userId: socket.data.userId,
-        isTyping: false,
-      })
-      return result
-    })
+    handle(
+      socket,
+      'message:delivered',
+      MessageDeliveredInput,
+      async (input) => {
+        const result = await messageStatus.markDelivered(
+          socket.data.userId,
+          input.conversationId,
+          input.upToSeq,
+        )
+        if (result.advanced) {
+          io.to(`conv:${input.conversationId}`).emit('message:status', {
+            conversationId: input.conversationId,
+            userId: socket.data.userId,
+            kind: 'delivered',
+            upToSeq: result.upToSeq,
+          })
+        }
+        return {}
+      },
+      handlerOptions,
+    )
 
-    handle(socket, 'message:delete', MessageDeleteInput, async (input) => {
-      const result = await messages.deleteMessage(socket.data.userId, input.messageId)
-      if (result.deleted) {
-        io.to(`conv:${result.conversationId}`).emit('message:deleted', {
-          conversationId: result.conversationId,
-          messageId: result.messageId,
-          seq: result.seq,
-        })
-      }
-      return { messageId: result.messageId, seq: result.seq }
-    })
-
-    handle(socket, 'message:delivered', MessageDeliveredInput, async (input) => {
-      const result = await messageStatus.markDelivered(
-        socket.data.userId,
-        input.conversationId,
-        input.upToSeq,
-      )
-      if (result.advanced) {
-        io.to(`conv:${input.conversationId}`).emit('message:status', {
-          conversationId: input.conversationId,
-          userId: socket.data.userId,
-          kind: 'delivered',
-          upToSeq: result.upToSeq,
-        })
-      }
-      return {}
-    })
-
-    handle(socket, 'conversation:read', ConversationReadInput, async (input) => {
-      const result = await messageStatus.markRead(
-        socket.data.userId,
-        input.conversationId,
-        input.upToSeq,
-      )
-      if (result.advanced) {
-        io.to(`conv:${input.conversationId}`).emit('message:status', {
-          conversationId: input.conversationId,
-          userId: socket.data.userId,
-          kind: 'read',
-          upToSeq: result.upToSeq,
-        })
-      }
-      return { unreadCount: result.unreadCount }
-    })
+    handle(
+      socket,
+      'conversation:read',
+      ConversationReadInput,
+      async (input) => {
+        const result = await messageStatus.markRead(
+          socket.data.userId,
+          input.conversationId,
+          input.upToSeq,
+        )
+        if (result.advanced) {
+          io.to(`conv:${input.conversationId}`).emit('message:status', {
+            conversationId: input.conversationId,
+            userId: socket.data.userId,
+            kind: 'read',
+            upToSeq: result.upToSeq,
+          })
+        }
+        return { unreadCount: result.unreadCount }
+      },
+      handlerOptions,
+    )
 
     const handleTyping = async (conversationId: string, isTyping: boolean): Promise<void> => {
       const room = `conv:${conversationId}`
@@ -211,33 +274,85 @@ export async function createRealtimeServer(
       })
     }
 
-    handle(socket, 'typing:start', TypingInput, async ({ conversationId }) => {
-      await handleTyping(conversationId, true)
-    })
-    handle(socket, 'typing:stop', TypingInput, async ({ conversationId }) => {
-      await handleTyping(conversationId, false)
-    })
+    handle(
+      socket,
+      'typing:start',
+      TypingInput,
+      async ({ conversationId }) => {
+        await handleTyping(conversationId, true)
+      },
+      handlerOptions,
+    )
+    handle(
+      socket,
+      'typing:stop',
+      TypingInput,
+      async ({ conversationId }) => {
+        await handleTyping(conversationId, false)
+      },
+      handlerOptions,
+    )
 
-    handle(socket, 'presence:ping', PresencePingInput, async () => {
-      const becameOnline = await presence.heartbeat(socket.data.userId, socket.id)
-      if (becameOnline) {
-        await broadcastPresence(socket.data.userId, true, null)
-      }
-    })
+    handle(
+      socket,
+      'presence:ping',
+      PresencePingInput,
+      async () => {
+        const becameOnline = await presence.heartbeat(socket.data.userId, socket.id)
+        if (becameOnline) {
+          await broadcastPresence(socket.data.userId, true, null)
+        }
+      },
+      handlerOptions,
+    )
   })
 
   return io
 }
 
-export async function closeRealtimeServer(io: RealtimeServer): Promise<void> {
-  const clients = adapterClients.get(io)
-  if (!clients) {
+export async function closeRealtimeServer(
+  io: RealtimeServer,
+  options: RealtimeServerCloseOptions = {},
+): Promise<void> {
+  const resources = realtimeResources.get(io)
+  if (!resources) {
     throw new Error('Realtime server Redis clients were not found')
   }
 
-  await io.close()
-  adapterClients.delete(io)
-  await Promise.all(clients.map((client) => client.quit()))
+  for (const socket of io.sockets.sockets.values()) {
+    socket.disconnect(true)
+  }
+  while (resources.pendingTasks.size > 0) {
+    await Promise.all(resources.pendingTasks)
+  }
+  if (options.waitForPendingPresence) {
+    await resources.presence.waitForPendingOfflineTransitions()
+  }
+
+  realtimeResources.delete(io)
+  const errors: unknown[] = []
+  try {
+    await io.close()
+  } catch (error) {
+    errors.push(error)
+  }
+  const results = await Promise.allSettled(resources.clients.map((client) => client.quit()))
+  errors.push(
+    ...results
+      .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+      .map(({ reason }) => reason),
+  )
+  if (errors.length > 0) {
+    throw new AggregateError(errors, 'One or more realtime resources failed to close')
+  }
+}
+
+function trackTask(tasks: Set<Promise<void>>, task: Promise<void>): void {
+  tasks.add(task)
+  void task.then(
+    () => tasks.delete(task),
+    () => tasks.delete(task),
+  )
 }
 
 function waitForRedisReady(client: Redis): Promise<void> {

@@ -8,6 +8,7 @@ export default defineConfig({
           name: 'api',
           include: ['apps/api/tests/**/*.test.ts'],
           setupFiles: ['apps/api/tests/setup.ts'],
+          fileParallelism: false,
         },
       },
       {

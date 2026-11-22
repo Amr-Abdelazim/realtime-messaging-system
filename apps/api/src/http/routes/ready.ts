@@ -3,34 +3,41 @@ import { Router, type Router as ExpressRouter } from 'express'
 import { prisma } from '../../infra/prisma.js'
 import { redis } from '../../infra/redis.js'
 
-const router: ExpressRouter = Router()
+export function createReadyRouter(isShuttingDown: () => boolean = () => false): ExpressRouter {
+  const router: ExpressRouter = Router()
 
-router.get('/ready', async (_req, res) => {
-  const checks = {
-    postgres: false,
-    redis: false,
-  }
+  router.get('/ready', async (_req, res) => {
+    if (isShuttingDown()) {
+      res.status(503).json({ status: 'shutting_down' })
+      return
+    }
 
-  try {
-    await prisma.$queryRaw`SELECT 1`
-    checks.postgres = true
-  } catch {
-    checks.postgres = false
-  }
+    const checks = {
+      postgres: false,
+      redis: false,
+    }
 
-  try {
-    await redis.ping()
-    checks.redis = true
-  } catch {
-    checks.redis = false
-  }
+    try {
+      await prisma.$queryRaw`SELECT 1`
+      checks.postgres = true
+    } catch {
+      checks.postgres = false
+    }
 
-  if (checks.postgres && checks.redis) {
-    res.status(200).json({ status: 'ready' })
-    return
-  }
+    try {
+      await redis.ping()
+      checks.redis = true
+    } catch {
+      checks.redis = false
+    }
 
-  res.status(503).json({ status: 'not_ready', checks })
-})
+    if (checks.postgres && checks.redis) {
+      res.status(200).json({ status: 'ready' })
+      return
+    }
 
-export default router
+    res.status(503).json({ status: 'not_ready', checks })
+  })
+
+  return router
+}

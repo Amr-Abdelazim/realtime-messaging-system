@@ -10,12 +10,13 @@ import { requestLogger } from './middleware/request-logger.js'
 import { notFoundHandler } from './middleware/not-found.js'
 import { errorHandler } from './middleware/error-handler.js'
 import healthRouter from './routes/health.js'
-import readyRouter from './routes/ready.js'
+import { createReadyRouter } from './routes/ready.js'
 import { createAuthRouter } from './routes/auth.js'
 import usersRouter from './routes/users.js'
 import { createConversationsRouter } from './routes/conversations.js'
 import presenceRouter from './routes/presence.js'
 import type { RateLimitPolicy } from '../infra/rateLimit.js'
+import { metricsRegistry } from '../infra/metrics.js'
 import type { RealtimeGateway } from '../realtime/gateway.js'
 
 export type AppOptions = {
@@ -27,6 +28,7 @@ export type AppOptions = {
     loginFailures?: RateLimitPolicy
   }
   gateway?: RealtimeGateway
+  isShuttingDown?: () => boolean
 }
 
 const defaultRateLimits = {
@@ -80,6 +82,15 @@ export function createApp(options: AppOptions = {}): Express {
     }),
   )
 
+  app.use((req, res, next) => {
+    if (options.isShuttingDown?.() && req.path !== '/ready') {
+      res.status(503).json({ status: 'shutting_down' })
+      return
+    }
+
+    next()
+  })
+
   app.use('/api/v1', limitByIp('api', rateLimits.api.limit, rateLimits.api.windowSeconds))
   app.post(
     '/api/v1/auth/register',
@@ -95,8 +106,12 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(cookieParser())
 
   // Routes will go here
+  app.get('/metrics', async (_req, res) => {
+    res.setHeader('Content-Type', metricsRegistry.contentType)
+    res.end(await metricsRegistry.metrics())
+  })
   app.use(healthRouter)
-  app.use(readyRouter)
+  app.use(createReadyRouter(options.isShuttingDown))
   app.use(
     '/api/v1',
     createAuthRouter({
