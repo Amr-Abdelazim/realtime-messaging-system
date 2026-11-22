@@ -1,5 +1,11 @@
-import { ConversationDto, MessageDto } from '@realtime-messaging/contracts'
+import { ConversationDto } from '@realtime-messaging/contracts'
 import { Prisma } from '@prisma/client'
+
+import {
+  messageWithReplyInclude,
+  toMessageDto,
+  type MessageWithReply,
+} from '../messages/mappers.js'
 
 export const conversationInclude = {
   participants: {
@@ -18,18 +24,7 @@ export const conversationInclude = {
       },
     },
   },
-  lastMessage: {
-    include: {
-      replyTo: {
-        select: {
-          id: true,
-          senderId: true,
-          content: true,
-          deletedAt: true,
-        },
-      },
-    },
-  },
+  lastMessage: { include: messageWithReplyInclude },
 } satisfies Prisma.ConversationInclude
 
 export const conversationListSelect = {
@@ -38,18 +33,7 @@ export const conversationListSelect = {
   name: true,
   lastSeq: true,
   lastMessageAt: true,
-  lastMessage: {
-    include: {
-      replyTo: {
-        select: {
-          id: true,
-          senderId: true,
-          content: true,
-          deletedAt: true,
-        },
-      },
-    },
-  },
+  lastMessage: { include: messageWithReplyInclude },
   participants: {
     where: { leftAt: null },
     orderBy: [{ joinedAt: 'asc' }, { userId: 'asc' }],
@@ -84,7 +68,7 @@ export type ConversationListRow = Prisma.ConversationGetPayload<{
 
 type ConversationMember = ConversationWithRelations['participants'][number]
 type ConversationSummary = Pick<ConversationWithRelations, 'id' | 'type' | 'name' | 'lastSeq'> & {
-  lastMessage: ConversationWithRelations['lastMessage']
+  lastMessage: MessageWithReply | null
 }
 
 function mapConversationDto(
@@ -105,35 +89,10 @@ function mapConversationDto(
     })),
     lastSeq: row.lastSeq,
     memberCount,
-    lastMessage: mapLastMessage(row.lastMessage),
+    lastMessage: row.lastMessage ? toMessageDto(row.lastMessage) : null,
     unreadCount: viewer.unreadCount,
     myLastReadSeq: viewer.lastReadSeq,
     peerPresence: null,
-  })
-}
-
-function mapLastMessage(message: NonNullable<ConversationWithRelations['lastMessage']> | null) {
-  if (!message) {
-    return null
-  }
-
-  return MessageDto.parse({
-    id: message.id,
-    conversationId: message.conversationId,
-    seq: message.seq,
-    senderId: message.senderId,
-    type: message.type,
-    content: message.deletedAt ? null : message.content,
-    clientMessageId: message.clientMessageId,
-    replyTo: message.replyTo
-      ? {
-          id: message.replyTo.id,
-          senderId: message.replyTo.senderId,
-          preview: message.replyTo.deletedAt ? 'Message deleted' : message.replyTo.content,
-        }
-      : null,
-    createdAt: message.createdAt.toISOString(),
-    deletedAt: message.deletedAt?.toISOString() ?? null,
   })
 }
 

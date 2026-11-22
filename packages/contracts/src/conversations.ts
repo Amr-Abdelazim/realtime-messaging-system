@@ -39,6 +39,19 @@ export const ConversationListQuery = z.object({
 
 export type ConversationListQuery = z.infer<typeof ConversationListQuery>
 
+export const MessageHistoryQuery = z
+  .object({
+    beforeSeq: z.coerce.number().int().nonnegative().optional(),
+    afterSeq: z.coerce.number().int().nonnegative().optional(),
+    limit: z.coerce.number().int().min(1).max(100).default(30),
+  })
+  .refine((query) => query.beforeSeq === undefined || query.afterSeq === undefined, {
+    message: 'beforeSeq and afterSeq cannot be used together',
+    path: ['afterSeq'],
+  })
+
+export type MessageHistoryQuery = z.infer<typeof MessageHistoryQuery>
+
 export const MessageDto = z.object({
   id: IdSchema,
   conversationId: IdSchema,
@@ -51,7 +64,7 @@ export const MessageDto = z.object({
     .object({
       id: IdSchema,
       senderId: IdSchema.nullable(),
-      preview: z.string(),
+      preview: z.string().nullable(),
     })
     .nullable(),
   createdAt: IsoDateSchema,
@@ -59,6 +72,13 @@ export const MessageDto = z.object({
 })
 
 export type MessageDto = z.infer<typeof MessageDto>
+
+export const MessageHistoryResponse = z.object({
+  items: z.array(MessageDto),
+  hasMore: z.boolean(),
+})
+
+export type MessageHistoryResponse = z.infer<typeof MessageHistoryResponse>
 
 export const ConversationDto = z.object({
   id: IdSchema,

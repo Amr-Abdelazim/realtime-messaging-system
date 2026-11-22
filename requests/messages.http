@@ -1,0 +1,11 @@
+### Get latest messages (newest first)
+GET {{baseUrl}}/conversations/{{conversationId}}/messages?limit=30
+Authorization: Bearer {{accessToken}}
+
+### Get older messages (newest first)
+GET {{baseUrl}}/conversations/{{conversationId}}/messages?beforeSeq=120&limit=30
+Authorization: Bearer {{accessToken}}
+
+### Fill a message gap (oldest first)
+GET {{baseUrl}}/conversations/{{conversationId}}/messages?afterSeq=90&limit=100
+Authorization: Bearer {{accessToken}}

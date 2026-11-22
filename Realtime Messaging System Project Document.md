@@ -462,9 +462,11 @@ Side effects: adding/removing members emits `conversation:updated` / `conversati
 
 | Method | Path | Query | Response |
 | --- | --- | --- | --- |
-| GET | `/conversations/:id/messages` | `beforeSeq?`, `limit?` | `{ items: Message[], hasMore }` newest first |
-| GET | `/conversations/:id/messages` | `afterSeq`, `limit?` | `{ items: Message[], hasMore }` oldest first (gap fill) |
+| GET | `/conversations/:id/messages` | `beforeSeq?`, `limit?` (default 30, max 100) | `{ items: Message[], hasMore }` newest first |
+| GET | `/conversations/:id/messages` | `afterSeq`, `limit?` (default 30, max 100) | `{ items: Message[], hasMore }` oldest first (gap fill) |
 | DELETE | `/messages/:id` |  | `204` (sender only), then `message:deleted` is broadcast |
+
+`beforeSeq` and `afterSeq` cannot be combined. Message history is limited to `seq > joinedAtSeq`; users who are not active conversation members receive `404`. Deleted message content is `null`, and reply previews contain at most 80 characters or `null` when the replied message is deleted.
 
 Sending messages is done over the socket (section 9); an optional REST fallback `POST /conversations/:id/messages` can reuse the same service and idempotency key.
 
@@ -486,7 +488,7 @@ export const MessageDto = z.object({
   type: z.enum(['TEXT', 'SYSTEM']),
   content: z.string().nullable(),          // null when deleted
   clientMessageId: z.string().uuid(),
-  replyTo: z.object({ id: z.string(), senderId: z.string().nullable(), preview: z.string() }).nullable(),
+  replyTo: z.object({ id: z.string(), senderId: z.string().nullable(), preview: z.string().nullable() }).nullable(),
   createdAt: z.string().datetime(),
   deletedAt: z.string().datetime().nullable(),
 });
