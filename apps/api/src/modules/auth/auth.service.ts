@@ -2,8 +2,10 @@ import { Prisma } from '@prisma/client'
 import argon2 from 'argon2'
 
 import type { AuthResponse, LoginBody, RegisterBody } from '@realtime-messaging/contracts'
-import { ConflictError, UnauthenticatedError } from '../../http/errors/index.js'
+import { ConflictError, RateLimitedError, UnauthenticatedError } from '../../http/errors/index.js'
 import { prisma } from '../../infra/prisma.js'
+import { redis } from '../../infra/redis.js'
+import type { RateLimitPolicy } from '../../infra/rateLimit.js'
 import { createSession } from './sessions.js'
 import { signAccessToken } from './tokens.js'
 
@@ -129,7 +131,18 @@ export async function register(
   }
 }
 
-export async function login(input: LoginBody, context: AuthContext): Promise<AuthSessionResult> {
+export async function login(
+  input: LoginBody,
+  context: AuthContext,
+  loginFailures: RateLimitPolicy,
+): Promise<AuthSessionResult> {
+  const failureKey = `login:fail:${input.email}`
+  const previousFailures = Number((await redis.get(failureKey)) ?? 0)
+  if (previousFailures >= loginFailures.limit) {
+    const retryAfterSeconds = Math.max(1, await redis.ttl(failureKey))
+    throw new RateLimitedError('Too many failed login attempts', retryAfterSeconds)
+  }
+
   const user = await prisma.user.findUnique({
     where: { email: input.email },
     select: {
@@ -143,8 +156,19 @@ export async function login(input: LoginBody, context: AuthContext): Promise<Aut
     : await argon2.verify(DUMMY_PASSWORD_HASH, input.password)
 
   if (!user || !passwordMatches) {
+    const failures = await redis.incr(failureKey)
+    if (failures === 1) {
+      await redis.expire(failureKey, loginFailures.windowSeconds)
+    }
+
+    if (failures >= loginFailures.limit) {
+      const retryAfterSeconds = Math.max(1, await redis.ttl(failureKey))
+      throw new RateLimitedError('Too many failed login attempts', retryAfterSeconds)
+    }
+
     throw new UnauthenticatedError('Invalid email or password')
   }
 
+  await redis.del(failureKey)
   return prisma.$transaction((transaction) => createAuthSession(user, context, transaction))
 }
