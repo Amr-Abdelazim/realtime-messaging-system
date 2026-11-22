@@ -140,6 +140,14 @@ function deleteMessage(socket: TestSocket, messageId: string): Promise<DeleteAck
   return new Promise((resolve) => socket.emit('message:delete', { messageId }, resolve))
 }
 
+function sendTyping(
+  socket: TestSocket,
+  event: 'typing:start' | 'typing:stop',
+  conversationId: string,
+): void {
+  socket.emit(event, { conversationId })
+}
+
 async function createRegisteredSession(
   overrides: Partial<ReturnType<typeof makeRegistration>> = {},
 ) {
@@ -1747,6 +1755,104 @@ describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
     expect(participants.find(({ userId }) => userId === recipient.auth.user.id)?.unreadCount).toBe(
       1,
     )
+  })
+
+  it('broadcasts typing to other conversation members and clears after a sent message', async () => {
+    const sender = await createRegisteredSession()
+    const recipient = await createRegisteredSession()
+    const outsider = await createRegisteredSession()
+    const conversation = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${sender.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: recipient.auth.user.id })
+      .expect(201)
+    const conversationId = conversation.body.id as string
+    const senderSocket = connectSocket(sender.auth.accessToken)
+    const recipientSocket = connectSocket(recipient.auth.accessToken)
+    const outsiderSocket = connectSocket(outsider.auth.accessToken)
+    await Promise.all([
+      waitForReady(senderSocket),
+      waitForReady(recipientSocket),
+      waitForReady(outsiderSocket),
+    ])
+    const queryCountBeforeTyping = observedQueries.length
+
+    const recipientTyping: Array<{ conversationId: string; userId: string; isTyping: boolean }> = []
+    const senderTyping: Array<{ conversationId: string; userId: string; isTyping: boolean }> = []
+    recipientSocket.on('typing', (event) => recipientTyping.push(event))
+    senderSocket.on('typing', (event) => senderTyping.push(event))
+
+    const started = new Promise((resolve) => recipientSocket.once('typing', resolve))
+    sendTyping(senderSocket, 'typing:start', conversationId)
+    expect(await started).toEqual({
+      conversationId,
+      userId: sender.auth.user.id,
+      isTyping: true,
+    })
+    sendTyping(outsiderSocket, 'typing:start', conversationId)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(recipientTyping).toHaveLength(1)
+
+    const stopped = new Promise((resolve) => recipientSocket.once('typing', resolve))
+    sendTyping(senderSocket, 'typing:stop', conversationId)
+    expect(await stopped).toEqual({
+      conversationId,
+      userId: sender.auth.user.id,
+      isTyping: false,
+    })
+    expect(senderTyping).toEqual([])
+    expect(observedQueries).toHaveLength(queryCountBeforeTyping)
+
+    const messageEvents: string[] = []
+    recipientSocket.on('message:new', () => messageEvents.push('message:new'))
+    recipientSocket.on('typing', ({ isTyping }) => {
+      if (!isTyping) {
+        messageEvents.push('typing:false')
+      }
+    })
+    const typingCleared = new Promise<void>((resolve) => {
+      recipientSocket.once('typing', ({ isTyping }) => {
+        if (!isTyping) {
+          resolve()
+        }
+      })
+    })
+    const ack = await sendMessage(senderSocket, {
+      conversationId,
+      clientMessageId: randomUUID(),
+      content: 'Clear typing after send',
+    })
+    expect(ack.ok).toBe(true)
+    await typingCleared
+    expect(messageEvents).toEqual(['message:new', 'typing:false'])
+    expect(senderTyping).toEqual([])
+  })
+
+  it('silently drops typing events above the shared per-user rate limit', async () => {
+    const sender = await createRegisteredSession()
+    const recipient = await createRegisteredSession()
+    const conversation = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${sender.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: recipient.auth.user.id })
+      .expect(201)
+    const senderSocket = connectSocket(sender.auth.accessToken)
+    const recipientSocket = connectSocket(recipient.auth.accessToken)
+    await Promise.all([waitForReady(senderSocket), waitForReady(recipientSocket)])
+    let receivedEvents = 0
+    recipientSocket.on('typing', () => {
+      receivedEvents += 1
+    })
+
+    for (let index = 0; index < 11; index += 1) {
+      sendTyping(
+        senderSocket,
+        index % 2 === 0 ? 'typing:start' : 'typing:stop',
+        conversation.body.id as string,
+      )
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(receivedEvents).toBe(10)
   })
 
   it('deletes only the sender message once and preserves its tombstone in history and chat list', async () => {

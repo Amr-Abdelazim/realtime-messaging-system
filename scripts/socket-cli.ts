@@ -1,7 +1,13 @@
 import { randomUUID } from 'node:crypto'
 import { createInterface } from 'node:readline'
 
-import { io } from 'socket.io-client'
+import { io, type Socket } from 'socket.io-client'
+import type {
+  ClientToServerEvents,
+  ServerToClientEvents,
+} from '../packages/contracts/src/socket.js'
+
+type SocketClient = Socket<ServerToClientEvents, ClientToServerEvents>
 
 const apiBaseUrl = (process.env.API_URL ?? 'http://localhost:3000/api/v1').replace(/\/+$/, '')
 const email = process.env.EMAIL
@@ -32,7 +38,7 @@ if (
 
 const socket = io(new URL(apiBaseUrl).origin, {
   auth: { token: loginBody.accessToken },
-})
+}) as SocketClient
 socket.onAny((event, ...args) => {
   console.log(event, ...args)
 })
@@ -45,7 +51,7 @@ socket.on('connect_error', (error) => {
 
 const input = createInterface({ input: process.stdin, output: process.stdout })
 const commands =
-  'Commands: send <conversationId> <text>, delivered <conversationId> <upToSeq>, read <conversationId> <upToSeq>, help, reconnect, quit'
+  'Commands: send <conversationId> <text>, delivered <conversationId> <upToSeq>, read <conversationId> <upToSeq>, typing on|off <conversationId>, help, reconnect, quit'
 console.log(commands)
 input.on('line', (line) => {
   const command = line.trim()
@@ -89,6 +95,17 @@ input.on('line', (line) => {
           console.log('ack', ack),
         )
       }
+      return
+    }
+  }
+
+  const typingCommand = /^typing\s+(on|off)\s+(\S+)$/i.exec(command)
+  if (typingCommand) {
+    const [, action, conversationId] = typingCommand
+    if (action && conversationId) {
+      socket.emit(action.toLowerCase() === 'on' ? 'typing:start' : 'typing:stop', {
+        conversationId,
+      })
       return
     }
   }

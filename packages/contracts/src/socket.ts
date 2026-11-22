@@ -42,6 +42,12 @@ export const ConversationReadInput = ConversationReadBody.extend({
 
 export type ConversationReadInput = z.infer<typeof ConversationReadInput>
 
+export const TypingInput = z.object({
+  conversationId: IdSchema,
+})
+
+export type TypingInput = z.infer<typeof TypingInput>
+
 export interface ClientToServerEvents {
   'message:send': (
     payload: SendMessageInput,
@@ -59,8 +65,8 @@ export interface ClientToServerEvents {
     payload: ConversationReadInput,
     ack: (response: SocketAck<{ unreadCount: number }>) => void,
   ) => void
-  'typing:start': (payload: { conversationId: string }) => void
-  'typing:stop': (payload: { conversationId: string }) => void
+  'typing:start': (payload: TypingInput) => void
+  'typing:stop': (payload: TypingInput) => void
   'presence:ping': () => void
 }
 

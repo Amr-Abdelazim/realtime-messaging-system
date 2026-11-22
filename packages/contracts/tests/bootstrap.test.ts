@@ -21,6 +21,7 @@ import {
   RegisterBody,
   SendMessageAck,
   SendMessageInput,
+  TypingInput,
   UpdateConversationBody,
   UpdateProfileBody,
   UserSearchQuery,
@@ -220,6 +221,9 @@ describe('shared contracts', () => {
       messageId: 'message-123',
     })
     expect(MessageDeleteInput.safeParse({}).success).toBe(false)
+    expect(TypingInput.parse({ conversationId: 'conversation-123' })).toEqual({
+      conversationId: 'conversation-123',
+    })
     expect(
       SendMessageInput.parse({
         conversationId: 'conversation-1',
