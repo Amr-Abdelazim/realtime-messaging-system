@@ -16,6 +16,7 @@ import {
   MessageDeleteInput,
   MessageDeliveredInput,
   SendMessageInput,
+  TypingInput,
 } from '@realtime-messaging/contracts'
 import { installSocketAuth } from './auth.js'
 import { handle } from './handler.js'
@@ -91,6 +92,11 @@ export function createRealtimeServer(
       if (!result.duplicate) {
         io.to(`conv:${input.conversationId}`).emit('message:new', { message: result.message })
       }
+      socket.to(`conv:${input.conversationId}`).emit('typing', {
+        conversationId: input.conversationId,
+        userId: socket.data.userId,
+        isTyping: false,
+      })
       return result
     })
 
@@ -138,6 +144,35 @@ export function createRealtimeServer(
         })
       }
       return { unreadCount: result.unreadCount }
+    })
+
+    const handleTyping = async (conversationId: string, isTyping: boolean): Promise<void> => {
+      const room = `conv:${conversationId}`
+      if (!socket.rooms.has(room)) {
+        return
+      }
+
+      const rateLimitResult = await rateLimit({
+        key: `rl:sock:${socket.data.userId}:typing`,
+        limit: 10,
+        windowSeconds: 10,
+      })
+      if (!rateLimitResult.allowed) {
+        return
+      }
+
+      socket.to(room).emit('typing', {
+        conversationId,
+        userId: socket.data.userId,
+        isTyping,
+      })
+    }
+
+    handle(socket, 'typing:start', TypingInput, async ({ conversationId }) => {
+      await handleTyping(conversationId, true)
+    })
+    handle(socket, 'typing:stop', TypingInput, async ({ conversationId }) => {
+      await handleTyping(conversationId, false)
     })
   })
 
