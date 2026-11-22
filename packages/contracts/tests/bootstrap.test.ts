@@ -14,6 +14,7 @@ import {
   IdSchema,
   IsoDateSchema,
   LoginBody,
+  MessageDeleteInput,
   MessageHistoryQuery,
   MessageHistoryResponse,
   PaginationQuery,
@@ -215,6 +216,10 @@ describe('shared contracts', () => {
 
   it('validates socket message-send payloads and acknowledgements', () => {
     const clientMessageId = 'c6cf1d2b-6eaa-4ca0-82e0-8ca46abfe807'
+    expect(MessageDeleteInput.parse({ messageId: 'message-123' })).toEqual({
+      messageId: 'message-123',
+    })
+    expect(MessageDeleteInput.safeParse({}).success).toBe(false)
     expect(
       SendMessageInput.parse({
         conversationId: 'conversation-1',

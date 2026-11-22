@@ -26,6 +26,7 @@ import {
   toConversationListDto,
 } from '../../modules/conversations/mappers.js'
 import { messageWithReplyInclude, toMessageDto } from '../../modules/messages/mappers.js'
+import { MessagesService } from '../../modules/messages/messages.service.js'
 import { MessageStatusService } from '../../modules/messages/status.service.js'
 import { NoopGateway, type RealtimeGateway } from '../../realtime/gateway.js'
 
@@ -34,6 +35,7 @@ export function createConversationsRouter(
 ): ExpressRouter {
   const router: ExpressRouter = Router()
   const conversations = new ConversationsService(gateway)
+  const messages = new MessagesService()
   const messageStatus = new MessageStatusService()
 
   const listHandler: RequestHandler = async (req, res) => {
@@ -308,6 +310,29 @@ export function createConversationsRouter(
     validate({ body: ConversationReadBody }),
     readConversationHandler,
   )
+
+  const deleteMessageHandler: RequestHandler = async (req, res) => {
+    if (!req.auth) {
+      throw new UnauthenticatedError()
+    }
+
+    const messageId = req.params.id
+    if (typeof messageId !== 'string') {
+      throw new NotFoundError('Message not found')
+    }
+
+    const result = await messages.deleteMessage(req.auth.userId, messageId)
+    if (result.deleted) {
+      gateway.toConversation(result.conversationId, 'message:deleted', {
+        conversationId: result.conversationId,
+        messageId: result.messageId,
+        seq: result.seq,
+      })
+    }
+    res.status(204).end()
+  }
+
+  router.delete('/messages/:id', requireAuth, deleteMessageHandler)
 
   const getConversationHandler: RequestHandler = async (req, res) => {
     if (!req.auth) {
