@@ -8,6 +8,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest'
 import { AuthResponse } from '@realtime-messaging/contracts'
 import { env } from '../../src/config/env.js'
 import { createApp } from '../../src/http/app.js'
+import { prisma as apiPrisma } from '../../src/infra/prisma.js'
 import { redis } from '../../src/infra/redis.js'
 import { REFRESH_COOKIE_NAME } from '../../src/modules/auth/cookies.js'
 import { hashRefreshToken, signAccessToken } from '../../src/modules/auth/tokens.js'
@@ -22,6 +23,9 @@ const app = createApp({
   },
 })
 const prisma = new PrismaClient()
+const observedQueries: string[] = []
+
+apiPrisma.$on('query', ({ query }) => observedQueries.push(query))
 
 const makeRegistration = () => {
   const suffix = randomUUID().replaceAll('-', '').slice(0, 12)
@@ -1091,6 +1095,184 @@ describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
       `user:${member.auth.user.id}:conversation:removed`,
       `conversation:${created.body.id}:conversation:updated`,
     ])
+  })
+
+  it('paginates active conversations by timestamp and id with viewer-specific state', async () => {
+    const viewer = await createRegisteredSession()
+    const peers = await Promise.all([
+      createRegisteredSession(),
+      createRegisteredSession(),
+      createRegisteredSession(),
+      createRegisteredSession(),
+    ])
+    const conversations = await Promise.all(
+      peers.map(
+        async (peer) =>
+          (
+            await request(app)
+              .post('/api/v1/conversations')
+              .set('authorization', `Bearer ${viewer.auth.accessToken}`)
+              .send({ type: 'DIRECT', userId: peer.auth.user.id })
+              .expect(201)
+          ).body,
+      ),
+    )
+    const [latest, tiedOne, tiedTwo, leftConversation] = conversations
+    if (!latest || !tiedOne || !tiedTwo || !leftConversation) {
+      throw new Error('Expected four direct conversations')
+    }
+
+    await Promise.all([
+      prisma.conversation.update({
+        where: { id: latest.id },
+        data: { lastMessageAt: new Date('2030-01-03T00:00:00.000Z'), lastSeq: 5 },
+      }),
+      prisma.conversation.update({
+        where: { id: tiedOne.id },
+        data: { lastMessageAt: new Date('2030-01-02T00:00:00.000Z'), lastSeq: 6 },
+      }),
+      prisma.conversation.update({
+        where: { id: tiedTwo.id },
+        data: { lastMessageAt: new Date('2030-01-02T00:00:00.000Z'), lastSeq: 7 },
+      }),
+      prisma.conversation.update({
+        where: { id: leftConversation.id },
+        data: { lastMessageAt: new Date('2030-01-04T00:00:00.000Z'), lastSeq: 8 },
+      }),
+      prisma.participant.update({
+        where: {
+          conversationId_userId: {
+            conversationId: leftConversation.id,
+            userId: viewer.auth.user.id,
+          },
+        },
+        data: { leftAt: new Date() },
+      }),
+      prisma.participant.update({
+        where: {
+          conversationId_userId: {
+            conversationId: latest.id,
+            userId: viewer.auth.user.id,
+          },
+        },
+        data: { unreadCount: 4, lastReadSeq: 1 },
+      }),
+      prisma.participant.update({
+        where: {
+          conversationId_userId: {
+            conversationId: tiedOne.id,
+            userId: viewer.auth.user.id,
+          },
+        },
+        data: { unreadCount: 2, lastReadSeq: 3 },
+      }),
+      prisma.participant.update({
+        where: {
+          conversationId_userId: {
+            conversationId: tiedTwo.id,
+            userId: viewer.auth.user.id,
+          },
+        },
+        data: { unreadCount: 1, lastReadSeq: 2 },
+      }),
+    ])
+    const deletedMessage = await prisma.message.create({
+      data: {
+        conversationId: latest.id,
+        seq: 5,
+        senderId: viewer.auth.user.id,
+        content: 'Deleted content',
+        clientMessageId: randomUUID(),
+        deletedAt: new Date(),
+      },
+    })
+    await prisma.conversation.update({
+      where: { id: latest.id },
+      data: { lastMessageId: deletedMessage.id },
+    })
+
+    const queryStart = observedQueries.length
+    const firstPage = await request(app)
+      .get('/api/v1/conversations?limit=2')
+      .set('authorization', `Bearer ${viewer.auth.accessToken}`)
+      .expect(200)
+    const queryCount = observedQueries.length - queryStart
+    expect(queryCount).toBeGreaterThan(0)
+    expect(queryCount).toBeLessThanOrEqual(3)
+
+    const tiedIds = [tiedOne.id, tiedTwo.id].sort().reverse()
+    expect(firstPage.body.items.map((item: { id: string }) => item.id)).toEqual([
+      latest.id,
+      tiedIds[0],
+    ])
+    expect(firstPage.body.items).toHaveLength(2)
+    expect(firstPage.body.items[0]).toMatchObject({
+      id: latest.id,
+      lastSeq: 5,
+      memberCount: 2,
+      unreadCount: 4,
+      myLastReadSeq: 1,
+      lastMessage: { content: null, seq: 5 },
+    })
+    expect(firstPage.body.items[0].members).toEqual([
+      expect.objectContaining({ userId: peers[0]?.auth.user.id }),
+    ])
+    expect(firstPage.body.nextCursor).toBeTypeOf('string')
+
+    const secondPage = await request(app)
+      .get(`/api/v1/conversations?limit=2&cursor=${encodeURIComponent(firstPage.body.nextCursor)}`)
+      .set('authorization', `Bearer ${viewer.auth.accessToken}`)
+      .expect(200)
+    expect(secondPage.body.items.map((item: { id: string }) => item.id)).toEqual([tiedIds[1]])
+    expect(secondPage.body.nextCursor).toBeNull()
+    expect(
+      [...firstPage.body.items, ...secondPage.body.items].some(
+        (item: { id: string }) => item.id === leftConversation.id,
+      ),
+    ).toBe(false)
+
+    const invalidCursor = await request(app)
+      .get('/api/v1/conversations?cursor=not-valid!')
+      .set('authorization', `Bearer ${viewer.auth.accessToken}`)
+    expect(invalidCursor.status).toBe(400)
+    expect(invalidCursor.body.error.code).toBe('VALIDATION_ERROR')
+  })
+
+  it('limits group chat-list members to five while returning the full member count', async () => {
+    const owner = await createRegisteredSession()
+    const seedPrefix = randomUUID().replaceAll('-', '').slice(0, 8)
+    const members = Array.from({ length: 6 }, (_, index) => {
+      const suffix = String(index).padStart(2, '0')
+      return {
+        email: `list-${seedPrefix}-${suffix}@example.com`,
+        username: `list_${seedPrefix}_${suffix}`,
+        passwordHash: 'test-password-hash',
+        displayName: `List Member ${suffix}`,
+      }
+    })
+    await prisma.user.createMany({ data: members })
+    const memberRows = await prisma.user.findMany({
+      where: { email: { in: members.map((member) => member.email) } },
+      select: { id: true },
+    })
+    const group = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .send({ type: 'GROUP', name: 'Chat list group', memberIds: memberRows.map(({ id }) => id) })
+      .expect(201)
+
+    const response = await request(app)
+      .get('/api/v1/conversations')
+      .set('authorization', `Bearer ${owner.auth.accessToken}`)
+      .expect(200)
+
+    expect(response.body.items).toHaveLength(1)
+    expect(response.body.items[0]).toMatchObject({
+      id: group.body.id,
+      type: 'GROUP',
+      memberCount: 7,
+    })
+    expect(response.body.items[0].members).toHaveLength(5)
   })
 
   it('returns TOKEN_EXPIRED for an expired access token', async () => {

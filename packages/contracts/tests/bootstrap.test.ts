@@ -5,6 +5,8 @@ import {
   AuthResponse,
   AddConversationMembersBody,
   ConversationDto,
+  ConversationListQuery,
+  ConversationListResponse,
   CreateConversationBody,
   ErrorCode,
   ErrorEnvelope,
@@ -168,12 +170,21 @@ describe('shared contracts', () => {
           },
         ],
         lastSeq: 0,
+        memberCount: 1,
         lastMessage: null,
         unreadCount: 0,
         myLastReadSeq: 0,
         peerPresence: null,
       }).type,
     ).toBe('DIRECT')
+
+    expect(ConversationListQuery.parse({})).toEqual({ limit: 30 })
+    expect(ConversationListQuery.parse({ limit: '50' })).toEqual({ limit: 50 })
+    expect(ConversationListQuery.safeParse({ limit: 51 }).success).toBe(false)
+    expect(ConversationListResponse.parse({ items: [], nextCursor: null })).toEqual({
+      items: [],
+      nextCursor: null,
+    })
   })
 
   it('can be composed with package schemas', () => {

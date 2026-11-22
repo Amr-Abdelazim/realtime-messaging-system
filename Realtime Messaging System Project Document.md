@@ -447,7 +447,7 @@ Rules:
 
 | Method | Path | Body / Query | Response |
 | --- | --- | --- | --- |
-| GET | `/conversations` | `limit`, `cursor` (by `lastMessageAt`) | list with `lastMessage`, `unreadCount`, `lastSeq`, peer `online` for direct |
+| GET | `/conversations` | `limit`, `cursor` (by `lastMessageAt`) | `{ items, nextCursor }`; items include `lastMessage`, `unreadCount`, `lastSeq`, and peer `online` for direct |
 | POST | `/conversations` | direct: `{ type: "DIRECT", userId }` or group: `{ type: "GROUP", name, memberIds[] }` | `201` conversation (direct returns existing one with `200` if it already exists) |
 | GET | `/conversations/:id` |  | details + members + roles |
 | PATCH | `/conversations/:id` | `{ name }` (group, admin+) | updated conversation |
@@ -500,6 +500,7 @@ export const ConversationDto = z.object({
     displayName: z.string(), avatarUrl: z.string().nullable(),
   })),
   lastSeq: z.number().int(),
+  memberCount: z.number().int(),
   lastMessage: MessageDto.nullable(),
   unreadCount: z.number().int(),
   myLastReadSeq: z.number().int(),

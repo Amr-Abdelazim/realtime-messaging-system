@@ -32,6 +32,13 @@ export const AddConversationMembersBody = z.object({
 
 export type AddConversationMembersBody = z.infer<typeof AddConversationMembersBody>
 
+export const ConversationListQuery = z.object({
+  limit: z.coerce.number().int().min(1).max(50).default(30),
+  cursor: z.string().min(1).optional(),
+})
+
+export type ConversationListQuery = z.infer<typeof ConversationListQuery>
+
 export const MessageDto = z.object({
   id: IdSchema,
   conversationId: IdSchema,
@@ -66,6 +73,7 @@ export const ConversationDto = z.object({
     }),
   ),
   lastSeq: z.number().int(),
+  memberCount: z.number().int().nonnegative(),
   lastMessage: MessageDto.nullable(),
   unreadCount: z.number().int(),
   myLastReadSeq: z.number().int(),
@@ -78,3 +86,10 @@ export const ConversationDto = z.object({
 })
 
 export type ConversationDto = z.infer<typeof ConversationDto>
+
+export const ConversationListResponse = z.object({
+  items: z.array(ConversationDto),
+  nextCursor: z.string().nullable(),
+})
+
+export type ConversationListResponse = z.infer<typeof ConversationListResponse>
