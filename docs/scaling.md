@@ -15,14 +15,17 @@ docker compose up --build
 ```
 
 Compose starts Postgres and Redis, runs `prisma migrate deploy` once, starts two
-API instances, and exposes nginx at `http://localhost:8080`. For example,
+API instances and the maintenance worker, and exposes nginx at
+`http://localhost:8080`. For example,
 `GET http://localhost:8080/health` returns the responding `instanceId`.
 `GET /ready` reports Postgres and Redis readiness. The root path returns 404
 until the web app is added in a later milestone.
 
 API and Socket.IO traffic is balanced between `api1` and `api2`. Inspect
-`docker compose logs -f api1 api2` to see each instance's structured logs and
-`instanceId`. The database and Redis are available only on the Compose network.
+`docker compose logs -f api1 api2 worker` to see the structured logs and
+`instanceId` for each process. The worker runs last-seen flush and presence
+sweep every 30 seconds, session cleanup hourly, and unread reconciliation at
+midnight UTC. The database and Redis are available only on the Compose network.
 
 ## Realtime message path
 

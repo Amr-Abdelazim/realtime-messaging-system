@@ -76,6 +76,23 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  worker:
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      INSTANCE_ID: worker
+      DATABASE_URL: postgresql://${POSTGRES_USER:-messaging}:${POSTGRES_PASSWORD:-messaging_dev}@postgres:5432/${POSTGRES_DB:-messaging}
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
   nginx:
     image: nginx:alpine
     ports:
