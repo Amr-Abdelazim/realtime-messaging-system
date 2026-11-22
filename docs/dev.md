@@ -9,8 +9,16 @@ API_URL=http://localhost:3000/api/v1 EMAIL=ada@example.com PASSWORD='your-passwo
 ```
 
 The CLI logs every server event and accepts `send <conversationId> <text>`,
-`delivered <conversationId> <upToSeq>`, `read <conversationId> <upToSeq>`,
-`typing on|off <conversationId>`, `help`, `reconnect`, and `quit`.
+`retry <clientMessageId>`, `delivered <conversationId> <upToSeq>`,
+`read <conversationId> <upToSeq>`, `typing on|off <conversationId>`, `help`,
+`reconnect`, and `quit`.
+
+The framework-free `@realtime-messaging/client-core` package exports
+`ChatClient`, `detectGap`, and `mergeMessages`. `ChatClient` takes the API base
+URL, access-token and refresh callbacks, and an optional `ChatStorage`
+implementation (memory storage is the default). It handles socket reconnects,
+message outbox retries, sequence synchronization, delivery acknowledgements,
+and presence heartbeats.
 
 Clients can also mark a conversation as read over REST with
 `POST /conversations/:id/read` and a JSON body such as `{"upToSeq": 12}`. The

@@ -8,7 +8,7 @@
     "dev": "pnpm --parallel --filter './apps/*' dev",
     "build": "pnpm -r --if-present build",
     "lint": "eslint .",
-    "typecheck": "pnpm --filter @realtime-messaging/contracts build && pnpm -r --if-present typecheck && pnpm exec tsc --noEmit -p prisma/tsconfig.json",
+    "typecheck": "pnpm --filter @realtime-messaging/contracts build && pnpm --filter @realtime-messaging/client-core build && pnpm -r --if-present typecheck && pnpm exec tsc --noEmit -p prisma/tsconfig.json",
     "test": "vitest run",
     "format": "prettier --write .",
     "db:migrate": "pnpm prisma migrate dev",

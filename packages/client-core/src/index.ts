@@ -1,0 +1,5 @@
+export { ChatClient } from './client.js'
+export type { ChatClientEvents, ChatClientOptions } from './client.js'
+export { createMemoryStorage } from './storage.js'
+export type { ChatStorage, OutboxMessage, OutboxStatus } from './storage.js'
+export { detectGap, mergeMessages } from './sync.js'
