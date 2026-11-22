@@ -9,7 +9,7 @@ import { createRealtimeServer } from './realtime/server.js'
 const gateway = new SocketGateway()
 const app = createApp({ gateway })
 const httpServer = createServer(app)
-const realtimeServer = createRealtimeServer(httpServer)
+const realtimeServer = await createRealtimeServer(httpServer)
 gateway.attach(realtimeServer)
 
 httpServer.listen(env.PORT, () => {

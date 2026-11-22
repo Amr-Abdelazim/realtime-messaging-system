@@ -30,8 +30,9 @@ import { hashRefreshToken, signAccessToken } from '../../src/modules/auth/tokens
 import { revokedSessionKey } from '../../src/modules/auth/sessions.js'
 import { MessagesService } from '../../src/modules/messages/messages.service.js'
 import { PresenceService } from '../../src/modules/presence/presence.service.js'
-import { createRealtimeServer } from '../../src/realtime/server.js'
+import { closeRealtimeServer, createRealtimeServer } from '../../src/realtime/server.js'
 import { SocketGateway } from '../../src/realtime/socketGateway.js'
+import type { RealtimeServer } from '../../src/realtime/types.js'
 import { disconnectDb, resetDb } from '../helpers/db.js'
 
 type TestSocket = ClientSocket<ServerToClientEvents, ClientToServerEvents>
@@ -50,8 +51,7 @@ const app = createApp({
   },
 })
 const realtimeHttpServer = createServer(app)
-const realtimeServer = createRealtimeServer(realtimeHttpServer)
-socketGateway.attach(realtimeServer)
+let realtimeServer: RealtimeServer
 const prisma = new PrismaClient()
 const observedQueries: string[] = []
 const socketClients = new Set<TestSocket>()
@@ -86,11 +86,16 @@ function getRefreshToken(response: { headers: { 'set-cookie'?: string[] } }): st
 }
 
 function connectSocket(token?: string): TestSocket {
-  const socket = createSocketClient(socketUrl, {
+  return connectSocketAt(socketUrl, token)
+}
+
+function connectSocketAt(url: string, token?: string): TestSocket {
+  const socket = createSocketClient(url, {
     auth: token === undefined ? {} : { token },
     autoConnect: false,
     reconnection: false,
     timeout: 5000,
+    transports: ['websocket'],
   }) as TestSocket
   socketClients.add(socket)
   return socket
@@ -279,6 +284,8 @@ class FailFirstFiveAcknowledgementsClient extends ChatClient {
 
 describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
   beforeAll(async () => {
+    realtimeServer = await createRealtimeServer(realtimeHttpServer)
+    socketGateway.attach(realtimeServer)
     await new Promise<void>((resolve, reject) => {
       realtimeHttpServer.once('error', reject)
       realtimeHttpServer.listen(0, '127.0.0.1', resolve)
@@ -302,7 +309,7 @@ describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
   })
 
   afterAll(async () => {
-    await new Promise<void>((resolve) => realtimeServer.close(() => resolve()))
+    await closeRealtimeServer(realtimeServer)
     await disconnectDb()
     await prisma.$disconnect()
   })
@@ -1789,6 +1796,128 @@ describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
 
     const remainingSockets = await realtimeServer.in(`conv:${group.body.id}`).fetchSockets()
     expect(remainingSockets.map(({ id }) => id)).not.toContain(socket.id)
+  })
+
+  it('shares realtime events and room joins across API instances', async () => {
+    const alice = await createRegisteredSession({ displayName: 'Scale Alice' })
+    const bob = await createRegisteredSession({ displayName: 'Scale Bob' })
+    const charlie = await createRegisteredSession({ displayName: 'Scale Charlie' })
+    const direct = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${alice.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: bob.auth.user.id })
+      .expect(201)
+    const group = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${alice.auth.accessToken}`)
+      .send({ type: 'GROUP', name: 'Scale group', memberIds: [bob.auth.user.id] })
+      .expect(201)
+
+    const secondGateway = new SocketGateway()
+    const secondHttpServer = createServer(createApp({ gateway: secondGateway }))
+    const secondRealtimeServer = await createRealtimeServer(secondHttpServer)
+    secondGateway.attach(secondRealtimeServer)
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        secondHttpServer.once('error', reject)
+        secondHttpServer.listen(0, '127.0.0.1', resolve)
+      })
+      const address = secondHttpServer.address()
+      if (!address || typeof address === 'string') {
+        throw new Error('Second socket test server did not bind to a TCP port')
+      }
+
+      const secondSocketUrl = `http://127.0.0.1:${address.port}`
+      const bobSocket = connectSocketAt(secondSocketUrl, bob.auth.accessToken)
+      const charlieSocket = connectSocketAt(secondSocketUrl, charlie.auth.accessToken)
+      await Promise.all([waitForReady(bobSocket), waitForReady(charlieSocket)])
+
+      const aliceOnline = waitForPresence(bobSocket, alice.auth.user.id, true)
+      const aliceSocket = connectSocket(alice.auth.accessToken)
+      await Promise.all([waitForReady(aliceSocket), aliceOnline])
+
+      const messageOnBob = new Promise((resolve) => {
+        bobSocket.once('message:new', resolve)
+      })
+      const directMessage = await sendMessage(aliceSocket, {
+        conversationId: direct.body.id,
+        clientMessageId: randomUUID(),
+        content: 'Message across instances',
+      })
+      if (!directMessage.ok) {
+        throw new Error('Cross-instance message send failed')
+      }
+      expect(await messageOnBob).toMatchObject({
+        message: { conversationId: direct.body.id, content: 'Message across instances' },
+      })
+
+      const typingOnBob = new Promise((resolve) => bobSocket.once('typing', resolve))
+      sendTyping(aliceSocket, 'typing:start', direct.body.id)
+      expect(await typingOnBob).toMatchObject({
+        conversationId: direct.body.id,
+        userId: alice.auth.user.id,
+        isTyping: true,
+      })
+
+      const deliveredOnAlice = new Promise((resolve) => {
+        aliceSocket.once('message:status', resolve)
+      })
+      await markDelivered(bobSocket, {
+        conversationId: direct.body.id,
+        upToSeq: directMessage.data.message.seq,
+      })
+      expect(await deliveredOnAlice).toMatchObject({
+        conversationId: direct.body.id,
+        userId: bob.auth.user.id,
+        kind: 'delivered',
+        upToSeq: directMessage.data.message.seq,
+      })
+
+      const readOnAlice = new Promise((resolve) => aliceSocket.once('message:status', resolve))
+      await markRead(bobSocket, {
+        conversationId: direct.body.id,
+        upToSeq: directMessage.data.message.seq,
+      })
+      expect(await readOnAlice).toMatchObject({
+        conversationId: direct.body.id,
+        userId: bob.auth.user.id,
+        kind: 'read',
+        upToSeq: directMessage.data.message.seq,
+      })
+
+      const groupUpdatedOnCharlie = new Promise((resolve) => {
+        charlieSocket.once('conversation:updated', resolve)
+      })
+      await request(app)
+        .post(`/api/v1/conversations/${group.body.id}/members`)
+        .set('authorization', `Bearer ${alice.auth.accessToken}`)
+        .send({ userIds: [charlie.auth.user.id] })
+        .expect(200)
+      expect(await groupUpdatedOnCharlie).toMatchObject({
+        conversation: { id: group.body.id },
+      })
+
+      const charlieGroupSockets = await secondRealtimeServer
+        .in(`conv:${group.body.id}`)
+        .fetchSockets()
+      expect(charlieGroupSockets.map(({ id }) => id)).toContain(charlieSocket.id)
+
+      const groupMessageOnCharlie = new Promise((resolve) => {
+        charlieSocket.once('message:new', resolve)
+      })
+      const groupMessage = await sendMessage(aliceSocket, {
+        conversationId: group.body.id,
+        clientMessageId: randomUUID(),
+        content: 'New group member receives this',
+      })
+      expect(groupMessage.ok).toBe(true)
+      expect(await groupMessageOnCharlie).toMatchObject({
+        message: { conversationId: group.body.id, content: 'New group member receives this' },
+      })
+    } finally {
+      await closeRealtimeServer(secondRealtimeServer)
+    }
   })
 
   it('sends a message once, acknowledges it, and broadcasts to every active device', async () => {

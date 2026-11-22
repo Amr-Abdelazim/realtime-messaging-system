@@ -1,6 +1,7 @@
 import { z } from 'zod'
 
 import dotenv from 'dotenv'
+import { hostname } from 'node:os'
 import { fileURLToPath } from 'node:url'
 
 dotenv.config({
@@ -13,6 +14,7 @@ const envSchema = z
 
     PORT: z.coerce.number().int().positive().default(3000),
     TRUST_PROXY: z.coerce.number().int().nonnegative().default(0),
+    INSTANCE_ID: z.string().min(1).default(hostname()),
 
     DATABASE_URL: z.string().url(),
 
