@@ -49,8 +49,10 @@ function getRefreshToken(response: { headers: { 'set-cookie'?: string[] } }): st
   return token
 }
 
-async function createRegisteredSession() {
-  const registration = makeRegistration()
+async function createRegisteredSession(
+  overrides: Partial<ReturnType<typeof makeRegistration>> = {},
+) {
+  const registration = { ...makeRegistration(), ...overrides }
   const response = await request(app).post('/api/v1/auth/register').send(registration).expect(201)
 
   return {
@@ -247,6 +249,158 @@ describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
 
     expect(response.status).toBe(401)
     expect(response.body.error.code).toBe('UNAUTHENTICATED')
+  })
+
+  it('updates and validates the authenticated user profile', async () => {
+    const { auth, registration } = await createRegisteredSession()
+    const response = await request(app)
+      .patch('/api/v1/users/me')
+      .set('authorization', `Bearer ${auth.accessToken}`)
+      .send({
+        displayName: '  Updated Name  ',
+        avatarUrl: 'https://example.com/avatar.png',
+      })
+      .expect(200)
+
+    expect(response.body).toMatchObject({
+      id: auth.user.id,
+      email: registration.email,
+      displayName: 'Updated Name',
+      avatarUrl: 'https://example.com/avatar.png',
+    })
+    const updatedUser = await prisma.user.findUniqueOrThrow({ where: { id: auth.user.id } })
+    expect(updatedUser.displayName).toBe('Updated Name')
+    expect(updatedUser.avatarUrl).toBe('https://example.com/avatar.png')
+
+    await request(app)
+      .patch('/api/v1/users/me')
+      .set('authorization', `Bearer ${auth.accessToken}`)
+      .send({ avatarUrl: null })
+      .expect(200)
+    expect((await prisma.user.findUniqueOrThrow({ where: { id: auth.user.id } })).avatarUrl).toBeNull()
+
+    const missingFields = await request(app)
+      .patch('/api/v1/users/me')
+      .set('authorization', `Bearer ${auth.accessToken}`)
+      .send({})
+    expect(missingFields.status).toBe(400)
+    expect(missingFields.body.error.code).toBe('VALIDATION_ERROR')
+
+    const insecureAvatar = await request(app)
+      .patch('/api/v1/users/me')
+      .set('authorization', `Bearer ${auth.accessToken}`)
+      .send({ avatarUrl: 'http://example.com/avatar.png' })
+    expect(insecureAvatar.status).toBe(400)
+    expect(insecureAvatar.body.error.code).toBe('VALIDATION_ERROR')
+
+    const blankName = await request(app)
+      .patch('/api/v1/users/me')
+      .set('authorization', `Bearer ${auth.accessToken}`)
+      .send({ displayName: '   ' })
+    expect(blankName.status).toBe(400)
+    expect(blankName.body.error.code).toBe('VALIDATION_ERROR')
+  })
+
+  it('searches users case-insensitively, excludes self, and applies the limit', async () => {
+    const { auth } = await createRegisteredSession({
+      username: 'needle_self',
+      displayName: 'Needle Self',
+    })
+    const fixtures = [
+      ...Array.from({ length: 11 }, (_, index) => {
+        const suffix = String(index).padStart(2, '0')
+        return {
+          email: `display-${suffix}@example.com`,
+          username: `display_${suffix}`,
+          passwordHash: 'test-password-hash',
+          displayName: `Needle Display ${suffix}`,
+        }
+      }),
+      ...Array.from({ length: 11 }, (_, index) => {
+        const suffix = String(index).padStart(2, '0')
+        return {
+          email: `needle-${suffix}@example.com`,
+          username: `needle_${suffix}`,
+          passwordHash: 'test-password-hash',
+          displayName: `Other User ${suffix}`,
+        }
+      }),
+    ]
+    await prisma.user.createMany({ data: fixtures })
+
+    const search = await request(app)
+      .get('/api/v1/users?q=NEEDLE&limit=20')
+      .set('authorization', `Bearer ${auth.accessToken}`)
+      .expect(200)
+
+    expect(search.body).toHaveLength(20)
+    expect(search.body.map((user: { username: string }) => user.username)).toEqual(
+      [...search.body.map((user: { username: string }) => user.username)].sort(),
+    )
+    expect(search.body.some((user: { id: string }) => user.id === auth.user.id)).toBe(false)
+    expect(search.body.some((user: { username: string }) => user.username === 'display_00')).toBe(
+      true,
+    )
+    expect(search.body.some((user: { username: string }) => user.username === 'needle_00')).toBe(
+      true,
+    )
+    expect(search.body.every((user: object) => !('email' in user))).toBe(true)
+
+    const defaultLimit = await request(app)
+      .get('/api/v1/users?q=NEEDLE')
+      .set('authorization', `Bearer ${auth.accessToken}`)
+      .expect(200)
+    expect(defaultLimit.body).toHaveLength(10)
+
+    const shortQuery = await request(app)
+      .get('/api/v1/users?q=N')
+      .set('authorization', `Bearer ${auth.accessToken}`)
+    expect(shortQuery.status).toBe(400)
+    expect(shortQuery.body.error.code).toBe('VALIDATION_ERROR')
+
+    const oversizedLimit = await request(app)
+      .get('/api/v1/users?q=NEEDLE&limit=21')
+      .set('authorization', `Bearer ${auth.accessToken}`)
+    expect(oversizedLimit.status).toBe(400)
+    expect(oversizedLimit.body.error.code).toBe('VALIDATION_ERROR')
+  })
+
+  it('returns a public user profile and 404 for an unknown user', async () => {
+    const { auth } = await createRegisteredSession()
+    const { auth: profile } = await createRegisteredSession({ displayName: 'Public Profile' })
+
+    const response = await request(app)
+      .get(`/api/v1/users/${profile.user.id}`)
+      .set('authorization', `Bearer ${auth.accessToken}`)
+      .expect(200)
+
+    expect(response.body).toMatchObject({
+      id: profile.user.id,
+      username: profile.user.username,
+      displayName: 'Public Profile',
+      avatarUrl: null,
+    })
+    expect(response.body).not.toHaveProperty('email')
+
+    await request(app)
+      .get(`/api/v1/users/${randomUUID()}`)
+      .set('authorization', `Bearer ${auth.accessToken}`)
+      .expect(404)
+  })
+
+  it('requires authentication for profile updates, search, and public profiles', async () => {
+    const requests = await Promise.all([
+      request(app).patch('/api/v1/users/me').send({ displayName: 'Updated' }),
+      request(app).get('/api/v1/users?q=ad'),
+      request(app).get(`/api/v1/users/${randomUUID()}`),
+    ])
+
+    expect(requests.map((response) => response.status)).toEqual([401, 401, 401])
+    expect(requests.map((response) => response.body.error.code)).toEqual([
+      'UNAUTHENTICATED',
+      'UNAUTHENTICATED',
+      'UNAUTHENTICATED',
+    ])
   })
 
   it('returns TOKEN_EXPIRED for an expired access token', async () => {

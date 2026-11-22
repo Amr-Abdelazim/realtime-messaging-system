@@ -1,0 +1,25 @@
+@baseUrl = http://localhost:3000/api/v1
+@accessToken = paste-access-token-here
+@userId = paste-user-id-here
+
+### Get current user profile
+GET {{baseUrl}}/users/me
+Authorization: Bearer {{accessToken}}
+
+### Update current user profile
+PATCH {{baseUrl}}/users/me
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+
+{
+  "displayName": "Updated Name",
+  "avatarUrl": "https://example.com/avatar.png"
+}
+
+### Search users
+GET {{baseUrl}}/users?q=alice&limit=10
+Authorization: Bearer {{accessToken}}
+
+### Get a public user profile
+GET {{baseUrl}}/users/{{userId}}
+Authorization: Bearer {{accessToken}}

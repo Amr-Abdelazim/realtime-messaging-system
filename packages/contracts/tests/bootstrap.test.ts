@@ -10,6 +10,8 @@ import {
   LoginBody,
   PaginationQuery,
   RegisterBody,
+  UpdateProfileBody,
+  UserSearchQuery,
 } from '../src/index.js'
 
 describe('shared contracts', () => {
@@ -96,6 +98,31 @@ describe('shared contracts', () => {
       email: 'alice@example.com',
       password: ' Password123! ',
     })
+  })
+
+  it('validates profile updates and user search queries', () => {
+    expect(
+      UpdateProfileBody.parse({
+        displayName: '  Ada  ',
+        avatarUrl: ' https://example.com/avatar.png ',
+      }),
+    ).toEqual({
+      displayName: 'Ada',
+      avatarUrl: 'https://example.com/avatar.png',
+    })
+    expect(UpdateProfileBody.parse({ avatarUrl: null })).toEqual({ avatarUrl: null })
+    expect(UpdateProfileBody.safeParse({}).success).toBe(false)
+    expect(UpdateProfileBody.safeParse({ avatarUrl: 'http://example.com/avatar.png' }).success).toBe(
+      false,
+    )
+    expect(
+      UpdateProfileBody.safeParse({ avatarUrl: `https://${'a'.repeat(500)}.com` }).success,
+    ).toBe(false)
+
+    expect(UserSearchQuery.parse({ q: '  Ada  ' })).toEqual({ q: 'Ada', limit: 10 })
+    expect(UserSearchQuery.parse({ q: 'Ada', limit: '20' })).toEqual({ q: 'Ada', limit: 20 })
+    expect(UserSearchQuery.safeParse({ q: 'A' }).success).toBe(false)
+    expect(UserSearchQuery.safeParse({ q: 'Ada', limit: 21 }).success).toBe(false)
   })
 
   it('can be composed with package schemas', () => {
