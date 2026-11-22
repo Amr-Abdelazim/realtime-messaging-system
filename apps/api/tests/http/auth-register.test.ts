@@ -8,7 +8,13 @@ import request from 'supertest'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
 import { AuthResponse } from '@realtime-messaging/contracts'
-import type { ClientToServerEvents, ServerToClientEvents } from '@realtime-messaging/contracts'
+import type {
+  ClientToServerEvents,
+  SendMessageAck,
+  SendMessageInput,
+  ServerToClientEvents,
+  SocketAck,
+} from '@realtime-messaging/contracts'
 import { env } from '../../src/config/env.js'
 import { createApp } from '../../src/http/app.js'
 import { prisma as apiPrisma } from '../../src/infra/prisma.js'
@@ -16,6 +22,7 @@ import { redis } from '../../src/infra/redis.js'
 import { REFRESH_COOKIE_NAME } from '../../src/modules/auth/cookies.js'
 import { hashRefreshToken, signAccessToken } from '../../src/modules/auth/tokens.js'
 import { revokedSessionKey } from '../../src/modules/auth/sessions.js'
+import { MessagesService } from '../../src/modules/messages/messages.service.js'
 import { createRealtimeServer } from '../../src/realtime/server.js'
 import { SocketGateway } from '../../src/realtime/socketGateway.js'
 import { disconnectDb, resetDb } from '../helpers/db.js'
@@ -91,6 +98,24 @@ function waitForConnectError(socket: TestSocket): Promise<string> {
     socket.once('connect_error', (error) => resolve(error.message))
     socket.once('connect', () => reject(new Error('Expected the socket connection to fail')))
     socket.connect()
+  })
+}
+
+function sendMessage(
+  socket: TestSocket,
+  input: SendMessageInput,
+): Promise<SocketAck<SendMessageAck>> {
+  return new Promise((resolve) => {
+    socket.emit('message:send', input, resolve)
+  })
+}
+
+function sendInvalidMessage(
+  socket: TestSocket,
+  input: unknown,
+): Promise<SocketAck<SendMessageAck>> {
+  return new Promise((resolve) => {
+    socket.emit('message:send', input as never, resolve)
   })
 }
 
@@ -1590,6 +1615,241 @@ describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
 
     const remainingSockets = await realtimeServer.in(`conv:${group.body.id}`).fetchSockets()
     expect(remainingSockets.map(({ id }) => id)).not.toContain(socket.id)
+  })
+
+  it('sends a message once, acknowledges it, and broadcasts to every active device', async () => {
+    const sender = await createRegisteredSession()
+    const recipient = await createRegisteredSession()
+    const conversation = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${sender.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: recipient.auth.user.id })
+      .expect(201)
+
+    const senderSocket = connectSocket(sender.auth.accessToken)
+    const otherDevice = connectSocket(sender.auth.accessToken)
+    const recipientSocket = connectSocket(recipient.auth.accessToken)
+    await Promise.all([
+      waitForReady(senderSocket),
+      waitForReady(otherDevice),
+      waitForReady(recipientSocket),
+    ])
+
+    let senderEvents = 0
+    let otherDeviceEvents = 0
+    let recipientEvents = 0
+    senderSocket.on('message:new', () => {
+      senderEvents += 1
+    })
+    otherDevice.on('message:new', () => {
+      otherDeviceEvents += 1
+    })
+    recipientSocket.on('message:new', () => {
+      recipientEvents += 1
+    })
+
+    const input: SendMessageInput = {
+      conversationId: conversation.body.id,
+      clientMessageId: randomUUID(),
+      content: '  Hello from a socket  ',
+    }
+    const firstAck = await sendMessage(senderSocket, input)
+    if (!firstAck.ok) {
+      throw new Error('Expected the message send to succeed')
+    }
+    expect(firstAck).toMatchObject({
+      data: {
+        duplicate: false,
+        message: {
+          conversationId: conversation.body.id,
+          seq: 1,
+          senderId: sender.auth.user.id,
+          content: 'Hello from a socket',
+          clientMessageId: input.clientMessageId,
+        },
+      },
+    })
+
+    const duplicateAck = await sendMessage(senderSocket, input)
+    if (!duplicateAck.ok) {
+      throw new Error('Expected the retry to return the stored message')
+    }
+    expect(duplicateAck).toMatchObject({
+      data: {
+        duplicate: true,
+        message: { id: firstAck.data.message.id },
+      },
+    })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(senderEvents).toBe(1)
+    expect(otherDeviceEvents).toBe(1)
+    expect(recipientEvents).toBe(1)
+
+    const participants = await prisma.participant.findMany({
+      where: { conversationId: conversation.body.id },
+      select: { userId: true, unreadCount: true, lastDeliveredSeq: true, lastReadSeq: true },
+    })
+    expect(participants.find(({ userId }) => userId === sender.auth.user.id)).toMatchObject({
+      unreadCount: 0,
+      lastDeliveredSeq: 1,
+      lastReadSeq: 1,
+    })
+    expect(participants.find(({ userId }) => userId === recipient.auth.user.id)?.unreadCount).toBe(
+      1,
+    )
+  })
+
+  it('serializes fifty concurrent message sends from both conversation members', async () => {
+    const firstSender = await createRegisteredSession()
+    const secondSender = await createRegisteredSession()
+    const conversation = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${firstSender.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: secondSender.auth.user.id })
+      .expect(201)
+    const messages = new MessagesService()
+
+    const results = await Promise.all(
+      Array.from({ length: 50 }, (_, index) =>
+        messages.sendMessage(index % 2 ? secondSender.auth.user.id : firstSender.auth.user.id, {
+          conversationId: conversation.body.id,
+          clientMessageId: randomUUID(),
+          content: `Concurrent ${index}`,
+        }),
+      ),
+    )
+
+    expect(results.map(({ message }) => message.seq).sort((a, b) => a - b)).toEqual(
+      Array.from({ length: 50 }, (_, index) => index + 1),
+    )
+    expect(await prisma.message.count({ where: { conversationId: conversation.body.id } })).toBe(50)
+    expect(
+      (
+        await prisma.conversation.findUniqueOrThrow({
+          where: { id: conversation.body.id },
+          select: { lastSeq: true },
+        })
+      ).lastSeq,
+    ).toBe(50)
+  })
+
+  it('resolves concurrent retries with the same client message id', async () => {
+    const sender = await createRegisteredSession()
+    const recipient = await createRegisteredSession()
+    const conversation = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${sender.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: recipient.auth.user.id })
+      .expect(201)
+    const messages = new MessagesService()
+    const input: SendMessageInput = {
+      conversationId: conversation.body.id,
+      clientMessageId: randomUUID(),
+      content: 'Retry me',
+    }
+
+    const results = await Promise.all([
+      messages.sendMessage(sender.auth.user.id, input),
+      messages.sendMessage(sender.auth.user.id, input),
+    ])
+
+    expect(results.map(({ duplicate }) => duplicate).sort()).toEqual([false, true])
+    expect(new Set(results.map(({ message }) => message.id)).size).toBe(1)
+    expect(
+      (
+        await prisma.conversation.findUniqueOrThrow({
+          where: { id: conversation.body.id },
+          select: { lastSeq: true },
+        })
+      ).lastSeq,
+    ).toBe(1)
+  })
+
+  it('validates message payloads and rejects non-members and cross-conversation replies', async () => {
+    const sender = await createRegisteredSession()
+    const recipient = await createRegisteredSession()
+    const outsider = await createRegisteredSession()
+    const replyPeer = await createRegisteredSession()
+    const conversation = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${sender.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: recipient.auth.user.id })
+      .expect(201)
+    const otherConversation = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${sender.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: replyPeer.auth.user.id })
+      .expect(201)
+    const messages = new MessagesService()
+    const replyTarget = await messages.sendMessage(sender.auth.user.id, {
+      conversationId: otherConversation.body.id,
+      clientMessageId: randomUUID(),
+      content: 'Not in this chat',
+    })
+
+    const senderSocket = connectSocket(sender.auth.accessToken)
+    const outsiderSocket = connectSocket(outsider.auth.accessToken)
+    await Promise.all([waitForReady(senderSocket), waitForReady(outsiderSocket)])
+
+    const invalid = await sendInvalidMessage(senderSocket, {
+      conversationId: conversation.body.id,
+      clientMessageId: 'not-a-uuid',
+      content: '   ',
+    })
+    expect(invalid).toMatchObject({ ok: false, error: { code: 'VALIDATION_ERROR' } })
+
+    const crossConversationReply = await sendMessage(senderSocket, {
+      conversationId: conversation.body.id,
+      clientMessageId: randomUUID(),
+      content: 'Invalid reply',
+      replyToId: replyTarget.message.id,
+    })
+    expect(crossConversationReply).toMatchObject({
+      ok: false,
+      error: { code: 'VALIDATION_ERROR' },
+    })
+
+    const forbidden = await sendMessage(outsiderSocket, {
+      conversationId: conversation.body.id,
+      clientMessageId: randomUUID(),
+      content: 'Not a member',
+    })
+    expect(forbidden).toMatchObject({ ok: false, error: { code: 'FORBIDDEN' } })
+  })
+
+  it('rate limits message sends and emits the retry delay', async () => {
+    const sender = await createRegisteredSession()
+    const recipient = await createRegisteredSession()
+    const conversation = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${sender.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: recipient.auth.user.id })
+      .expect(201)
+    const socket = connectSocket(sender.auth.accessToken)
+    await waitForReady(socket)
+
+    for (let index = 0; index < 20; index += 1) {
+      const ack = await sendMessage(socket, {
+        conversationId: conversation.body.id,
+        clientMessageId: randomUUID(),
+        content: `Rate limit ${index}`,
+      })
+      expect(ack.ok).toBe(true)
+    }
+
+    const rateLimitedEvent = new Promise<{ event: string; retryAfterMs: number }>((resolve) => {
+      socket.once('rate_limited', resolve)
+    })
+    const ack = await sendMessage(socket, {
+      conversationId: conversation.body.id,
+      clientMessageId: randomUUID(),
+      content: 'Over the limit',
+    })
+    expect(ack).toMatchObject({ ok: false, error: { code: 'RATE_LIMITED' } })
+    expect(await rateLimitedEvent).toMatchObject({
+      event: 'message:send',
+      retryAfterMs: expect.any(Number),
+    })
   })
 
   it('returns TOKEN_EXPIRED for an expired access token', async () => {

@@ -1,18 +1,30 @@
-import type { ConversationDto, MessageDto } from './conversations.js'
+import { z } from 'zod'
+
+import { IdSchema } from './common.js'
+import { MessageDto, type ConversationDto } from './conversations.js'
 
 export type SocketAck<T> =
   { ok: true; data: T } | { ok: false; error: { code: string; message: string } }
 
-export type SendMessageAck = { message: MessageDto; duplicate: boolean }
+export const SendMessageInput = z.object({
+  conversationId: IdSchema,
+  clientMessageId: z.string().uuid(),
+  content: z.string().trim().min(1).max(4000),
+  replyToId: IdSchema.optional(),
+})
+
+export type SendMessageInput = z.infer<typeof SendMessageInput>
+
+export const SendMessageAck = z.object({
+  message: MessageDto,
+  duplicate: z.boolean(),
+})
+
+export type SendMessageAck = z.infer<typeof SendMessageAck>
 
 export interface ClientToServerEvents {
   'message:send': (
-    payload: {
-      conversationId: string
-      clientMessageId: string
-      content: string
-      replyToId?: string
-    },
+    payload: SendMessageInput,
     ack: (response: SocketAck<SendMessageAck>) => void,
   ) => void
   'message:delete': (

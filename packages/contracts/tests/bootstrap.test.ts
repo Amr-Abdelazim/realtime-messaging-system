@@ -17,6 +17,8 @@ import {
   MessageHistoryResponse,
   PaginationQuery,
   RegisterBody,
+  SendMessageAck,
+  SendMessageInput,
   UpdateConversationBody,
   UpdateProfileBody,
   UserSearchQuery,
@@ -200,6 +202,53 @@ describe('shared contracts', () => {
       items: [],
       hasMore: false,
     })
+  })
+
+  it('validates socket message-send payloads and acknowledgements', () => {
+    const clientMessageId = 'c6cf1d2b-6eaa-4ca0-82e0-8ca46abfe807'
+    expect(
+      SendMessageInput.parse({
+        conversationId: 'conversation-1',
+        clientMessageId,
+        content: '  Hello  ',
+      }),
+    ).toEqual({
+      conversationId: 'conversation-1',
+      clientMessageId,
+      content: 'Hello',
+    })
+    expect(
+      SendMessageInput.safeParse({
+        conversationId: 'conversation-1',
+        clientMessageId,
+        content: '   ',
+      }).success,
+    ).toBe(false)
+    expect(
+      SendMessageInput.safeParse({
+        conversationId: 'conversation-1',
+        clientMessageId,
+        content: 'x'.repeat(4001),
+      }).success,
+    ).toBe(false)
+
+    expect(
+      SendMessageAck.parse({
+        message: {
+          id: 'message-1',
+          conversationId: 'conversation-1',
+          seq: 1,
+          senderId: 'user-1',
+          type: 'TEXT',
+          content: 'Hello',
+          clientMessageId,
+          replyTo: null,
+          createdAt: '2026-11-22T00:00:00.000Z',
+          deletedAt: null,
+        },
+        duplicate: false,
+      }).duplicate,
+    ).toBe(false)
   })
 
   it('can be composed with package schemas', () => {
