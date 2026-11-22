@@ -1,13 +1,6 @@
-import { randomUUID } from 'node:crypto'
 import { createInterface } from 'node:readline'
 
-import { io, type Socket } from 'socket.io-client'
-import type {
-  ClientToServerEvents,
-  ServerToClientEvents,
-} from '../packages/contracts/src/socket.js'
-
-type SocketClient = Socket<ServerToClientEvents, ClientToServerEvents>
+import { ChatClient } from '../packages/client-core/src/index.js'
 
 const apiBaseUrl = (process.env.API_URL ?? 'http://localhost:3000/api/v1').replace(/\/+$/, '')
 const email = process.env.EMAIL
@@ -26,38 +19,51 @@ if (!loginResponse.ok) {
   throw new Error(`REST login failed with status ${loginResponse.status}`)
 }
 
-const loginBody: unknown = await loginResponse.json()
-if (
-  typeof loginBody !== 'object' ||
-  loginBody === null ||
-  !('accessToken' in loginBody) ||
-  typeof loginBody.accessToken !== 'string'
-) {
-  throw new Error('REST login response did not contain an access token')
-}
+let accessToken = getAccessToken(await loginResponse.json())
+let refreshCookie = getRefreshCookie(loginResponse)
 
-const socket = io(new URL(apiBaseUrl).origin, {
-  auth: { token: loginBody.accessToken },
-}) as SocketClient
-socket.onAny((event, ...args) => {
+const client = new ChatClient({
+  baseUrl: apiBaseUrl,
+  getAccessToken: () => accessToken,
+  refreshAccessToken: async () => {
+    const response = await fetch(`${apiBaseUrl}/auth/refresh`, {
+      method: 'POST',
+      headers: { cookie: refreshCookie },
+    })
+    if (!response.ok) {
+      throw new Error(`REST token refresh failed with status ${response.status}`)
+    }
+
+    accessToken = getAccessToken(await response.json())
+    refreshCookie = getRefreshCookie(response)
+    return accessToken
+  },
+})
+
+client.onAny((event, ...args) => {
   console.log(event, ...args)
 })
-socket.on('connect', () => {
-  console.log(`Connected: ${socket.id}`)
+client.on('connect', () => {
+  console.log('Connected')
 })
-socket.on('connect_error', (error) => {
+client.on('connect_error', (error) => {
   console.error(`Connection failed: ${error.message}`)
 })
-const presenceHeartbeat = setInterval(() => {
-  if (socket.connected) {
-    socket.emit('presence:ping')
-  }
-}, 25_000)
+client.on('client:error', (error) => {
+  console.error(`Client error: ${error.message}`)
+})
+client.on('sync:complete', ({ messages }) => {
+  console.log(`Synchronization complete: ${messages.length} message(s)`)
+})
 
 const input = createInterface({ input: process.stdin, output: process.stdout })
 const commands =
-  'Commands: send <conversationId> <text>, delivered <conversationId> <upToSeq>, read <conversationId> <upToSeq>, typing on|off <conversationId>, help, reconnect, quit'
+  'Commands: send <conversationId> <text>, retry <clientMessageId>, delivered <conversationId> <upToSeq>, read <conversationId> <upToSeq>, typing on|off <conversationId>, help, reconnect, quit'
 console.log(commands)
+void client.connect().catch((error: unknown) => {
+  console.error(`Connection failed: ${error instanceof Error ? error.message : String(error)}`)
+})
+
 input.on('line', (line) => {
   const command = line.trim()
   if (command.toLowerCase() === 'help') {
@@ -65,7 +71,9 @@ input.on('line', (line) => {
     return
   }
   if (command.toLowerCase() === 'reconnect') {
-    socket.connect()
+    void client.reconnect().catch((error: unknown) => {
+      console.error(`Reconnect failed: ${error instanceof Error ? error.message : String(error)}`)
+    })
     return
   }
   if (command.toLowerCase() === 'quit') {
@@ -77,13 +85,25 @@ input.on('line', (line) => {
   if (sendCommand) {
     const [, conversationId, content] = sendCommand
     if (conversationId && content) {
-      socket.emit(
-        'message:send',
-        { conversationId, clientMessageId: randomUUID(), content },
-        (ack) => console.log('ack', ack),
-      )
+      void client
+        .send(conversationId, content)
+        .then((message) => console.log('outbox', message))
+        .catch((error: unknown) => {
+          console.error(`Send failed: ${error instanceof Error ? error.message : String(error)}`)
+        })
       return
     }
+  }
+
+  const retryCommand = /^retry\s+(\S+)$/i.exec(command)
+  if (retryCommand?.[1]) {
+    void client
+      .retry(retryCommand[1])
+      .then((message) => console.log('outbox', message))
+      .catch((error: unknown) => {
+        console.error(`Retry failed: ${error instanceof Error ? error.message : String(error)}`)
+      })
+    return
   }
 
   const statusCommand = /^(delivered|read)\s+(\S+)\s+(\d+)$/i.exec(command)
@@ -91,15 +111,17 @@ input.on('line', (line) => {
     const [, action, conversationId, sequence] = statusCommand
     const upToSeq = Number(sequence)
     if (action && conversationId && Number.isSafeInteger(upToSeq)) {
-      if (action.toLowerCase() === 'delivered') {
-        socket.emit('message:delivered', { conversationId, upToSeq }, (ack) =>
-          console.log('ack', ack),
-        )
-      } else {
-        socket.emit('conversation:read', { conversationId, upToSeq }, (ack) =>
-          console.log('ack', ack),
-        )
-      }
+      const request =
+        action.toLowerCase() === 'delivered'
+          ? client.markDelivered(conversationId, upToSeq)
+          : client.markRead(conversationId, upToSeq)
+      void request
+        .then((ack) => console.log('ack', ack))
+        .catch((error: unknown) => {
+          console.error(
+            `Status update failed: ${error instanceof Error ? error.message : String(error)}`,
+          )
+        })
       return
     }
   }
@@ -108,16 +130,32 @@ input.on('line', (line) => {
   if (typingCommand) {
     const [, action, conversationId] = typingCommand
     if (action && conversationId) {
-      socket.emit(action.toLowerCase() === 'on' ? 'typing:start' : 'typing:stop', {
-        conversationId,
-      })
+      client.setTyping(conversationId, action.toLowerCase() === 'on')
       return
     }
   }
 
   console.log(`Unknown command: ${command || '(empty)'}`)
 })
-input.on('close', () => {
-  clearInterval(presenceHeartbeat)
-  socket.disconnect()
-})
+
+input.on('close', () => client.close())
+
+function getAccessToken(value: unknown): string {
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    !('accessToken' in value) ||
+    typeof value.accessToken !== 'string'
+  ) {
+    throw new Error('REST response did not contain an access token')
+  }
+  return value.accessToken
+}
+
+function getRefreshCookie(response: Response): string {
+  const cookie = response.headers.get('set-cookie')?.split(';', 1)[0]
+  if (!cookie) {
+    throw new Error('REST response did not contain a refresh cookie')
+  }
+  return cookie
+}

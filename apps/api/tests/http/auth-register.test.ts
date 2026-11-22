@@ -15,6 +15,12 @@ import type {
   ServerToClientEvents,
   SocketAck,
 } from '@realtime-messaging/contracts'
+import {
+  ChatClient,
+  createMemoryStorage,
+  type ChatClientEvents,
+  type ChatStorage,
+} from '@realtime-messaging/client-core'
 import { env } from '../../src/config/env.js'
 import { createApp } from '../../src/http/app.js'
 import { prisma as apiPrisma } from '../../src/infra/prisma.js'
@@ -122,6 +128,65 @@ function waitForPresence(
   })
 }
 
+function waitForChatClientEvent<Event extends keyof ChatClientEvents>(
+  client: ChatClient,
+  event: Event,
+  predicate: (payload: ChatClientEvents[Event]) => boolean = () => true,
+  timeoutMs = 15_000,
+): Promise<ChatClientEvents[Event]> {
+  return new Promise((resolve, reject) => {
+    let unsubscribe = () => {}
+    const timeout = setTimeout(() => {
+      unsubscribe()
+      reject(new Error(`Timed out waiting for ChatClient event ${String(event)}`))
+    }, timeoutMs)
+    unsubscribe = client.on(event, (payload) => {
+      if (!predicate(payload)) {
+        return
+      }
+
+      clearTimeout(timeout)
+      unsubscribe()
+      resolve(payload)
+    })
+  })
+}
+
+function createChatClient(
+  accessToken: string,
+  storage: ChatStorage = createMemoryStorage(),
+): ChatClient {
+  return new ChatClient({
+    baseUrl: `${socketUrl}/api/v1`,
+    getAccessToken: () => accessToken,
+    refreshAccessToken: async () => {
+      throw new Error('Unexpected access-token refresh')
+    },
+    storage,
+  })
+}
+
+async function clearTestPresence(userIds: string[]): Promise<void> {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const pending = await Promise.all(
+      userIds.map((userId) => redis.exists(`presence:pending-offline:${userId}`)),
+    )
+    if (pending.every((exists) => exists === 1)) {
+      break
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+
+  const keys = userIds.flatMap((userId) => [
+    `presence:${userId}`,
+    `presence:pending-offline:${userId}`,
+    `lastSeen:${userId}`,
+  ])
+  await redis.del(...keys)
+  await redis.srem('presence:active', ...userIds)
+  await redis.srem('lastSeen:dirty', ...userIds)
+}
+
 function waitForConnectError(socket: TestSocket): Promise<string> {
   return new Promise((resolve, reject) => {
     socket.once('connect_error', (error) => resolve(error.message))
@@ -184,6 +249,31 @@ async function createRegisteredSession(
     registration,
     auth: AuthResponse.parse(response.body),
     refreshToken: getRefreshToken(response),
+  }
+}
+
+class DropFirstAcknowledgementClient extends ChatClient {
+  attempts = 0
+
+  protected override async requestMessageAck(input: SendMessageInput) {
+    const ack = await super.requestMessageAck(input)
+    this.attempts += 1
+    if (this.attempts === 1) {
+      throw new Error('Simulated lost acknowledgement')
+    }
+    return ack
+  }
+}
+
+class FailFirstFiveAcknowledgementsClient extends ChatClient {
+  attempts = 0
+
+  protected override async requestMessageAck(input: SendMessageInput) {
+    this.attempts += 1
+    if (this.attempts <= 5) {
+      throw new Error('Simulated acknowledgement timeout')
+    }
+    return super.requestMessageAck(input)
   }
 }
 
@@ -2041,6 +2131,362 @@ describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
       await redis.srem('lastSeen:dirty', reconnectUserId)
     }
   })
+
+  it('fills missed message pages after a client reconnects', async () => {
+    const recipient = await createRegisteredSession()
+    const sender = await createRegisteredSession()
+    const conversation = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${recipient.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: sender.auth.user.id })
+      .expect(201)
+    const conversationId = conversation.body.id as string
+    const startingSeq = conversation.body.lastSeq as number
+    const storage = createMemoryStorage()
+    const client = createChatClient(recipient.auth.accessToken, storage)
+    const senderSocket = connectSocket(sender.auth.accessToken)
+
+    try {
+      await waitForReady(senderSocket)
+      const initialReady = waitForChatClientEvent(client, 'ready')
+      const initialSync = waitForChatClientEvent(client, 'sync:complete')
+      await client.connect()
+      await Promise.all([initialReady, initialSync])
+
+      const disconnected = waitForChatClientEvent(client, 'disconnect')
+      client.disconnect()
+      await disconnected
+
+      const missedContents = Array.from(
+        { length: 20 },
+        (_, index) => `offline message ${index + 1}`,
+      )
+      for (const content of missedContents) {
+        const ack = await sendMessage(senderSocket, {
+          conversationId,
+          clientMessageId: randomUUID(),
+          content,
+        })
+        expect(ack.ok).toBe(true)
+      }
+
+      const reconnected = waitForChatClientEvent(client, 'ready')
+      const synchronized = waitForChatClientEvent(client, 'sync:complete')
+      await client.connect()
+      await Promise.all([reconnected, synchronized])
+      const result = await synchronized
+      expect(result.messages.map(({ content }) => content)).toEqual(missedContents)
+      expect(await storage.getLastSeq(conversationId)).toBe(startingSeq + 20)
+    } finally {
+      client.close()
+      senderSocket.disconnect()
+      await clearTestPresence([recipient.auth.user.id, sender.auth.user.id])
+    }
+  }, 30_000)
+
+  it('flushes pending outbox messages in order after reconnect', async () => {
+    const sender = await createRegisteredSession()
+    const recipient = await createRegisteredSession()
+    const conversation = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${sender.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: recipient.auth.user.id })
+      .expect(201)
+    const conversationId = conversation.body.id as string
+    const client = createChatClient(sender.auth.accessToken)
+
+    try {
+      const initialReady = waitForChatClientEvent(client, 'ready')
+      const initialSync = waitForChatClientEvent(client, 'sync:complete')
+      await client.connect()
+      await Promise.all([initialReady, initialSync])
+
+      const disconnected = waitForChatClientEvent(client, 'disconnect')
+      client.disconnect()
+      await disconnected
+      const contents = ['queued one', 'queued two', 'queued three']
+      const queued = await Promise.all(
+        contents.map((content) => client.send(conversationId, content)),
+      )
+      const expectedIds = queued.map(({ clientMessageId }) => clientMessageId)
+      expect(queued.map(({ status }) => status)).toEqual(['pending', 'pending', 'pending'])
+
+      const sentInOrder = new Promise<string[]>((resolve, reject) => {
+        const sentIds: string[] = []
+        let unsubscribe = () => {}
+        const timeout = setTimeout(() => {
+          unsubscribe()
+          reject(new Error('Timed out waiting for outbox flush'))
+        }, 15_000)
+        unsubscribe = client.on('outbox:update', (message) => {
+          if (message.status !== 'sent') {
+            return
+          }
+          sentIds.push(message.clientMessageId)
+          if (sentIds.length === expectedIds.length) {
+            clearTimeout(timeout)
+            unsubscribe()
+            resolve(sentIds)
+          }
+        })
+      })
+      const reconnected = waitForChatClientEvent(client, 'ready')
+      await client.connect()
+      await reconnected
+      expect(await sentInOrder).toEqual(expectedIds)
+
+      const stored = await prisma.message.findMany({
+        where: { conversationId, clientMessageId: { in: expectedIds } },
+        orderBy: { seq: 'asc' },
+        select: { clientMessageId: true, content: true },
+      })
+      expect(stored.map(({ content }) => content)).toEqual(contents)
+      expect(stored.map(({ clientMessageId }) => clientMessageId)).toEqual(expectedIds)
+    } finally {
+      client.close()
+      await clearTestPresence([sender.auth.user.id])
+    }
+  }, 30_000)
+
+  it('retries a message after a lost acknowledgement with the same idempotency key', async () => {
+    const sender = await createRegisteredSession()
+    const recipient = await createRegisteredSession()
+    const conversation = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${sender.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: recipient.auth.user.id })
+      .expect(201)
+    const conversationId = conversation.body.id as string
+    const client = new DropFirstAcknowledgementClient({
+      baseUrl: `${socketUrl}/api/v1`,
+      getAccessToken: () => sender.auth.accessToken,
+      refreshAccessToken: async () => {
+        throw new Error('Unexpected access-token refresh')
+      },
+    })
+
+    try {
+      const initialReady = waitForChatClientEvent(client, 'ready')
+      const initialSync = waitForChatClientEvent(client, 'sync:complete')
+      await client.connect()
+      await Promise.all([initialReady, initialSync])
+
+      const sent = await client.send(conversationId, 'persist exactly once')
+      expect(sent.status).toBe('sent')
+      expect(client.attempts).toBe(2)
+      const stored = await prisma.message.findMany({
+        where: { clientMessageId: sent.clientMessageId },
+        select: { id: true },
+      })
+      expect(stored).toHaveLength(1)
+    } finally {
+      client.close()
+      await clearTestPresence([sender.auth.user.id])
+    }
+  }, 20_000)
+
+  it('marks exhausted outbox sends failed and supports manual retry', async () => {
+    const sender = await createRegisteredSession()
+    const recipient = await createRegisteredSession()
+    const conversation = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${sender.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: recipient.auth.user.id })
+      .expect(201)
+    const conversationId = conversation.body.id as string
+    const client = new FailFirstFiveAcknowledgementsClient({
+      baseUrl: `${socketUrl}/api/v1`,
+      getAccessToken: () => sender.auth.accessToken,
+      refreshAccessToken: async () => {
+        throw new Error('Unexpected access-token refresh')
+      },
+    })
+
+    try {
+      const initialReady = waitForChatClientEvent(client, 'ready')
+      const initialSync = waitForChatClientEvent(client, 'sync:complete')
+      await client.connect()
+      await Promise.all([initialReady, initialSync])
+
+      const failed = await client.send(conversationId, 'manual retry')
+      expect(failed.status).toBe('failed')
+      expect(client.attempts).toBe(5)
+      const retried = await client.retry(failed.clientMessageId)
+      expect(retried.status).toBe('sent')
+      expect(client.attempts).toBe(6)
+
+      const stored = await prisma.message.findMany({
+        where: { clientMessageId: failed.clientMessageId },
+        select: { id: true },
+      })
+      expect(stored).toHaveLength(1)
+    } finally {
+      client.close()
+      await clearTestPresence([sender.auth.user.id])
+    }
+  }, 30_000)
+
+  it('fills a gap when a live message skips a stored sequence', async () => {
+    const recipient = await createRegisteredSession()
+    const sender = await createRegisteredSession()
+    const conversation = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${recipient.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: sender.auth.user.id })
+      .expect(201)
+    const conversationId = conversation.body.id as string
+    const sequences = new Map<string, number>()
+    const storage: ChatStorage = {
+      getLastSeq: (id) => sequences.get(id) ?? 0,
+      setLastSeq: (id, seq) => {
+        sequences.set(id, seq)
+      },
+      getOutbox: () => [],
+      setOutbox: () => {},
+    }
+    const client = createChatClient(recipient.auth.accessToken, storage)
+    const senderSocket = connectSocket(sender.auth.accessToken)
+
+    try {
+      await waitForReady(senderSocket)
+      const initialReady = waitForChatClientEvent(client, 'ready')
+      const initialSync = waitForChatClientEvent(client, 'sync:complete')
+      await client.connect()
+      await Promise.all([initialReady, initialSync])
+
+      const firstMessage = waitForChatClientEvent(
+        client,
+        'message:new',
+        ({ message }) => message.content === 'sequence one',
+      )
+      const firstAck = await sendMessage(senderSocket, {
+        conversationId,
+        clientMessageId: randomUUID(),
+        content: 'sequence one',
+      })
+      expect(firstAck.ok).toBe(true)
+      await firstMessage
+      await storage.setLastSeq(conversationId, 0)
+
+      const gapFilled = waitForChatClientEvent(
+        client,
+        'messages:sync',
+        ({ conversationId: id }) => id === conversationId,
+      )
+      const skippedMessage = waitForChatClientEvent(
+        client,
+        'message:new',
+        ({ message }) => message.content === 'sequence two',
+      )
+      const secondAck = await sendMessage(senderSocket, {
+        conversationId,
+        clientMessageId: randomUUID(),
+        content: 'sequence two',
+      })
+      expect(secondAck.ok).toBe(true)
+      const [gap, liveMessage] = await Promise.all([gapFilled, skippedMessage])
+      expect(gap.messages.map(({ content }) => content)).toEqual(['sequence one'])
+      expect(liveMessage.message.content).toBe('sequence two')
+      expect(await storage.getLastSeq(conversationId)).toBe(2)
+      const participant = await prisma.participant.findFirst({
+        where: { conversationId, userId: recipient.auth.user.id },
+        select: { lastDeliveredSeq: true },
+      })
+      expect(participant?.lastDeliveredSeq).toBe(2)
+    } finally {
+      client.close()
+      senderSocket.disconnect()
+      await clearTestPresence([recipient.auth.user.id, sender.auth.user.id])
+    }
+  }, 20_000)
+
+  it('refreshes an expired access token and reconnects automatically', async () => {
+    const user = await createRegisteredSession()
+    const session = await prisma.session.findFirst({
+      where: { userId: user.auth.user.id, revokedAt: null },
+      select: { id: true },
+    })
+    if (!session) {
+      throw new Error('Expected the registered user to have an active session')
+    }
+    const expiredAt = Math.floor(Date.now() / 1000) + 4
+    let accessToken = await new SignJWT({ sid: session.id })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setSubject(user.auth.user.id)
+      .setIssuedAt()
+      .setExpirationTime(expiredAt)
+      .sign(new TextEncoder().encode(env.JWT_ACCESS_SECRET))
+    let refreshToken = user.refreshToken
+    let refreshCount = 0
+    const client = new ChatClient({
+      baseUrl: `${socketUrl}/api/v1`,
+      getAccessToken: () => accessToken,
+      refreshAccessToken: async () => {
+        const response = await request(app)
+          .post('/api/v1/auth/refresh')
+          .set('cookie', `${REFRESH_COOKIE_NAME}=${refreshToken}`)
+          .expect(200)
+        refreshToken = getRefreshToken(response)
+        accessToken = response.body.accessToken as string
+        refreshCount += 1
+        return accessToken
+      },
+    })
+
+    try {
+      let readyCount = 0
+      const reconnected = waitForChatClientEvent(
+        client,
+        'ready',
+        () => {
+          readyCount += 1
+          return readyCount === 2
+        },
+        15_000,
+      )
+      const firstReady = waitForChatClientEvent(client, 'ready')
+      await client.connect()
+      await firstReady
+      await reconnected
+      expect(refreshCount).toBe(1)
+    } finally {
+      client.close()
+      await clearTestPresence([user.auth.user.id])
+    }
+  }, 20_000)
+
+  it('refreshes the socket presence score with automatic heartbeats', async () => {
+    const user = await createRegisteredSession()
+    const client = createChatClient(user.auth.accessToken)
+
+    try {
+      const ready = waitForChatClientEvent(client, 'ready')
+      const synchronized = waitForChatClientEvent(client, 'sync:complete')
+      await client.connect()
+      await Promise.all([ready, synchronized])
+
+      const presenceKey = `presence:${user.auth.user.id}`
+      const [socketId] = await redis.zrange(presenceKey, '0', '0')
+      if (!socketId) {
+        throw new Error('Expected the connected client to have a presence socket')
+      }
+      const initialScore = await redis.zscore(presenceKey, socketId)
+      if (initialScore === null) {
+        throw new Error('Expected the connected presence socket to have an expiry score')
+      }
+
+      const deadline = Date.now() + 30_000
+      let refreshedScore = initialScore
+      while (Date.now() < deadline && Number(refreshedScore) <= Number(initialScore)) {
+        await new Promise((resolve) => setTimeout(resolve, 200))
+        refreshedScore = (await redis.zscore(presenceKey, socketId)) ?? initialScore
+      }
+      expect(Number(refreshedScore)).toBeGreaterThan(Number(initialScore))
+    } finally {
+      client.close()
+      await clearTestPresence([user.auth.user.id])
+    }
+  }, 40_000)
 
   it('deletes only the sender message once and preserves its tombstone in history and chat list', async () => {
     const sender = await createRegisteredSession()
