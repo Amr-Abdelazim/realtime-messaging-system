@@ -1,17 +1,27 @@
 import {
   AddConversationMembersBody,
+  ConversationListQuery,
+  ConversationListResponse,
   CreateConversationBody,
+  IdSchema,
+  IsoDateSchema,
   UpdateConversationBody,
 } from '@realtime-messaging/contracts'
 import { Prisma } from '@prisma/client'
 import { Router, type RequestHandler, type Router as ExpressRouter } from 'express'
+import { z } from 'zod'
 
 import { NotFoundError, UnauthenticatedError, ValidationError } from '../errors/index.js'
 import { requireAuth } from '../middleware/requireAuth.js'
 import { validate } from '../middleware/validate.js'
 import { prisma } from '../../infra/prisma.js'
 import { ConversationsService } from '../../modules/conversations/conversations.service.js'
-import { conversationInclude, toConversationDto } from '../../modules/conversations/mappers.js'
+import {
+  conversationInclude,
+  conversationListSelect,
+  toConversationDto,
+  toConversationListDto,
+} from '../../modules/conversations/mappers.js'
 import { NoopGateway, type RealtimeGateway } from '../../realtime/gateway.js'
 
 export function createConversationsRouter(
@@ -19,6 +29,75 @@ export function createConversationsRouter(
 ): ExpressRouter {
   const router: ExpressRouter = Router()
   const conversations = new ConversationsService(gateway)
+
+  const listHandler: RequestHandler = async (req, res) => {
+    if (!req.auth) {
+      throw new UnauthenticatedError()
+    }
+
+    const userId = req.auth.userId
+    const parsedQuery = ConversationListQuery.safeParse(req.query)
+    if (!parsedQuery.success) {
+      const details = parsedQuery.error.issues.map((issue) => ({
+        path: issue.path.length > 0 ? issue.path.join('.') : 'query',
+        message: issue.message,
+      }))
+      throw new ValidationError('Invalid request', details)
+    }
+
+    const { limit, cursor: encodedCursor } = parsedQuery.data
+    const cursor = encodedCursor ? decodeConversationCursor(encodedCursor) : undefined
+    const rows = await prisma.participant.findMany({
+      relationLoadStrategy: 'join',
+      where: {
+        userId,
+        leftAt: null,
+        conversation: {
+          is: {
+            lastMessageAt: { not: null },
+            ...(cursor
+              ? {
+                  OR: [
+                    { lastMessageAt: { lt: cursor.lastMessageAt } },
+                    { lastMessageAt: cursor.lastMessageAt, id: { lt: cursor.id } },
+                  ],
+                }
+              : {}),
+          },
+        },
+      },
+      orderBy: [{ conversation: { lastMessageAt: 'desc' } }, { conversationId: 'desc' }],
+      take: limit + 1,
+      select: {
+        unreadCount: true,
+        lastReadSeq: true,
+        conversation: { select: conversationListSelect },
+      },
+    })
+
+    const hasMore = rows.length > limit
+    const pageRows = rows.slice(0, limit)
+    const items = pageRows.map(({ conversation, unreadCount, lastReadSeq }) =>
+      toConversationListDto(conversation, userId, { unreadCount, lastReadSeq }),
+    )
+    let nextCursor: string | null = null
+    if (hasMore) {
+      const lastRow = pageRows.at(-1)
+      if (!lastRow) {
+        throw new Error('Cannot encode a cursor for an empty page')
+      }
+
+      const lastMessageAt = lastRow.conversation.lastMessageAt
+      if (!lastMessageAt) {
+        throw new Error('Cannot encode a cursor for a conversation without lastMessageAt')
+      }
+      nextCursor = encodeConversationCursor(lastMessageAt, lastRow.conversation.id)
+    }
+
+    res.status(200).json(ConversationListResponse.parse({ items, nextCursor }))
+  }
+
+  router.get('/conversations', requireAuth, listHandler)
 
   const createConversationHandler: RequestHandler = async (req, res) => {
     if (!req.auth) {
@@ -209,4 +288,51 @@ export function createConversationsRouter(
   router.post('/conversations/:id/leave', requireAuth, leaveGroupHandler)
 
   return router
+}
+
+const ConversationCursorPayload = z
+  .object({
+    lastMessageAt: IsoDateSchema,
+    id: IdSchema,
+  })
+  .strict()
+
+function decodeConversationCursor(cursor: string): { lastMessageAt: Date; id: string } {
+  if (!/^[A-Za-z0-9_-]+$/.test(cursor)) {
+    throw new ValidationError('Invalid cursor', [{ path: 'cursor', message: 'Invalid base64url' }])
+  }
+
+  const decoded = Buffer.from(cursor, 'base64url')
+  if (decoded.toString('base64url') !== cursor) {
+    throw new ValidationError('Invalid cursor', [{ path: 'cursor', message: 'Invalid base64url' }])
+  }
+
+  let value: unknown
+  try {
+    value = JSON.parse(decoded.toString('utf8'))
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw new ValidationError('Invalid cursor', [{ path: 'cursor', message: 'Invalid JSON' }])
+    }
+    throw error
+  }
+
+  const parsed = ConversationCursorPayload.safeParse(value)
+  if (!parsed.success) {
+    throw new ValidationError(
+      'Invalid cursor',
+      parsed.error.issues.map((issue) => ({
+        path: issue.path.length > 0 ? `cursor.${issue.path.join('.')}` : 'cursor',
+        message: issue.message,
+      })),
+    )
+  }
+
+  return { lastMessageAt: new Date(parsed.data.lastMessageAt), id: parsed.data.id }
+}
+
+function encodeConversationCursor(lastMessageAt: Date, id: string): string {
+  return Buffer.from(JSON.stringify({ lastMessageAt: lastMessageAt.toISOString(), id })).toString(
+    'base64url',
+  )
 }

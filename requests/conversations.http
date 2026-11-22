@@ -29,6 +29,10 @@ Content-Type: application/json
 GET {{baseUrl}}/conversations/{{conversationId}}
 Authorization: Bearer {{accessToken}}
 
+### List conversations
+GET {{baseUrl}}/conversations?limit=30
+Authorization: Bearer {{accessToken}}
+
 ### Rename a group
 PATCH {{baseUrl}}/conversations/{{conversationId}}
 Authorization: Bearer {{accessToken}}
