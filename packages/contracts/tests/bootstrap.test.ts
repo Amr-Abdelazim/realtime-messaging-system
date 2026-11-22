@@ -13,6 +13,8 @@ import {
   IdSchema,
   IsoDateSchema,
   LoginBody,
+  MessageHistoryQuery,
+  MessageHistoryResponse,
   PaginationQuery,
   RegisterBody,
   UpdateConversationBody,
@@ -184,6 +186,19 @@ describe('shared contracts', () => {
     expect(ConversationListResponse.parse({ items: [], nextCursor: null })).toEqual({
       items: [],
       nextCursor: null,
+    })
+
+    expect(MessageHistoryQuery.parse({})).toEqual({ limit: 30 })
+    expect(MessageHistoryQuery.parse({ beforeSeq: '12', limit: '100' })).toEqual({
+      beforeSeq: 12,
+      limit: 100,
+    })
+    expect(MessageHistoryQuery.safeParse({ beforeSeq: '2', afterSeq: '3' }).success).toBe(false)
+    expect(MessageHistoryQuery.safeParse({ afterSeq: '-1' }).success).toBe(false)
+    expect(MessageHistoryQuery.safeParse({ limit: 101 }).success).toBe(false)
+    expect(MessageHistoryResponse.parse({ items: [], hasMore: false })).toEqual({
+      items: [],
+      hasMore: false,
     })
   })
 

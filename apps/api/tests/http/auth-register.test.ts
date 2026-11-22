@@ -1275,6 +1275,166 @@ describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
     expect(response.body.items[0].members).toHaveLength(5)
   })
 
+  it('paginates message history in both directions and maps deleted messages and replies', async () => {
+    const viewer = await createRegisteredSession()
+    const peer = await createRegisteredSession()
+    const conversation = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${viewer.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: peer.auth.user.id })
+      .expect(201)
+    const messageIds = Array.from({ length: 7 }, () => randomUUID())
+
+    for (let seq = 1; seq <= 7; seq += 1) {
+      await prisma.message.create({
+        data: {
+          id: messageIds[seq - 1],
+          conversationId: conversation.body.id,
+          seq,
+          senderId: viewer.auth.user.id,
+          content: seq === 4 ? 'x'.repeat(100) : `Message ${seq}`,
+          clientMessageId: randomUUID(),
+          ...(seq === 5 ? { deletedAt: new Date() } : {}),
+          ...(seq === 6 ? { replyToId: messageIds[4] } : {}),
+          ...(seq === 7 ? { replyToId: messageIds[3] } : {}),
+        },
+      })
+    }
+    await prisma.conversation.update({
+      where: { id: conversation.body.id },
+      data: { lastSeq: 7, lastMessageId: messageIds[6], lastMessageAt: new Date() },
+    })
+
+    const headers = { authorization: `Bearer ${viewer.auth.accessToken}` }
+    const latest = await request(app)
+      .get(`/api/v1/conversations/${conversation.body.id}/messages?limit=3`)
+      .set(headers)
+      .expect(200)
+    expect(latest.body.items.map((item: { seq: number }) => item.seq)).toEqual([7, 6, 5])
+    expect(latest.body.hasMore).toBe(true)
+    expect(latest.body.items[0].replyTo.preview).toBe('x'.repeat(80))
+    expect(latest.body.items[1].replyTo.preview).toBeNull()
+    expect(latest.body.items[2]).toMatchObject({
+      content: null,
+      deletedAt: expect.any(String),
+    })
+
+    const olderPage = await request(app)
+      .get(`/api/v1/conversations/${conversation.body.id}/messages?beforeSeq=5&limit=2`)
+      .set(headers)
+      .expect(200)
+    expect(olderPage.body.items.map((item: { seq: number }) => item.seq)).toEqual([4, 3])
+    expect(olderPage.body.hasMore).toBe(true)
+
+    const oldestPage = await request(app)
+      .get(`/api/v1/conversations/${conversation.body.id}/messages?beforeSeq=3&limit=2`)
+      .set(headers)
+      .expect(200)
+    expect(oldestPage.body.items.map((item: { seq: number }) => item.seq)).toEqual([2, 1])
+    expect(oldestPage.body.hasMore).toBe(false)
+
+    const walkedPages = [...latest.body.items, ...olderPage.body.items, ...oldestPage.body.items]
+    expect(walkedPages.map((item: { seq: number }) => item.seq)).toEqual([7, 6, 5, 4, 3, 2, 1])
+    expect(new Set(walkedPages.map((item: { seq: number }) => item.seq)).size).toBe(7)
+
+    const afterPage = await request(app)
+      .get(`/api/v1/conversations/${conversation.body.id}/messages?afterSeq=2&limit=2`)
+      .set(headers)
+      .expect(200)
+    expect(afterPage.body.items.map((item: { seq: number }) => item.seq)).toEqual([3, 4])
+    expect(afterPage.body.hasMore).toBe(true)
+  })
+
+  it('hides messages before a participant joined and returns 404 for non-members and leavers', async () => {
+    const viewer = await createRegisteredSession()
+    const peer = await createRegisteredSession()
+    const outsider = await createRegisteredSession()
+    const conversation = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${viewer.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: peer.auth.user.id })
+      .expect(201)
+
+    for (let seq = 1; seq <= 4; seq += 1) {
+      await prisma.message.create({
+        data: {
+          conversationId: conversation.body.id,
+          seq,
+          senderId: peer.auth.user.id,
+          content: `Message ${seq}`,
+          clientMessageId: randomUUID(),
+        },
+      })
+    }
+    await prisma.conversation.update({
+      where: { id: conversation.body.id },
+      data: { lastSeq: 4 },
+    })
+    await prisma.participant.update({
+      where: {
+        conversationId_userId: {
+          conversationId: conversation.body.id,
+          userId: viewer.auth.user.id,
+        },
+      },
+      data: { joinedAtSeq: 2 },
+    })
+
+    const path = `/api/v1/conversations/${conversation.body.id}/messages`
+    const recent = await request(app)
+      .get(`${path}?limit=10`)
+      .set('authorization', `Bearer ${viewer.auth.accessToken}`)
+      .expect(200)
+    expect(recent.body.items.map((item: { seq: number }) => item.seq)).toEqual([4, 3])
+
+    const gapFill = await request(app)
+      .get(`${path}?afterSeq=0&limit=10`)
+      .set('authorization', `Bearer ${viewer.auth.accessToken}`)
+      .expect(200)
+    expect(gapFill.body.items.map((item: { seq: number }) => item.seq)).toEqual([3, 4])
+
+    const olderMessages = await request(app)
+      .get(`${path}?beforeSeq=4&limit=10`)
+      .set('authorization', `Bearer ${viewer.auth.accessToken}`)
+      .expect(200)
+    expect(olderMessages.body.items.map((item: { seq: number }) => item.seq)).toEqual([3])
+
+    const nonMember = await request(app)
+      .get(path)
+      .set('authorization', `Bearer ${outsider.auth.accessToken}`)
+    expect(nonMember.status).toBe(404)
+    expect(nonMember.body.error.code).toBe('NOT_FOUND')
+
+    await prisma.participant.update({
+      where: {
+        conversationId_userId: {
+          conversationId: conversation.body.id,
+          userId: viewer.auth.user.id,
+        },
+      },
+      data: { leftAt: new Date() },
+    })
+    const leaver = await request(app)
+      .get(path)
+      .set('authorization', `Bearer ${viewer.auth.accessToken}`)
+    expect(leaver.status).toBe(404)
+    expect(leaver.body.error.code).toBe('NOT_FOUND')
+  })
+
+  it('rejects invalid message-history cursors and limits', async () => {
+    const viewer = await createRegisteredSession()
+    const path = `/api/v1/conversations/${randomUUID()}/messages`
+    const headers = { authorization: `Bearer ${viewer.auth.accessToken}` }
+
+    const bothCursors = await request(app).get(`${path}?beforeSeq=2&afterSeq=1`).set(headers)
+    expect(bothCursors.status).toBe(400)
+    expect(bothCursors.body.error.code).toBe('VALIDATION_ERROR')
+
+    const tooMany = await request(app).get(`${path}?limit=101`).set(headers)
+    expect(tooMany.status).toBe(400)
+    expect(tooMany.body.error.code).toBe('VALIDATION_ERROR')
+  })
+
   it('returns TOKEN_EXPIRED for an expired access token', async () => {
     const now = Math.floor(Date.now() / 1000)
     const expiredToken = await new SignJWT({ sid: randomUUID() })

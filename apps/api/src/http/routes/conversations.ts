@@ -5,6 +5,8 @@ import {
   CreateConversationBody,
   IdSchema,
   IsoDateSchema,
+  MessageHistoryQuery,
+  MessageHistoryResponse,
   UpdateConversationBody,
 } from '@realtime-messaging/contracts'
 import { Prisma } from '@prisma/client'
@@ -22,6 +24,7 @@ import {
   toConversationDto,
   toConversationListDto,
 } from '../../modules/conversations/mappers.js'
+import { messageWithReplyInclude, toMessageDto } from '../../modules/messages/mappers.js'
 import { NoopGateway, type RealtimeGateway } from '../../realtime/gateway.js'
 
 export function createConversationsRouter(
@@ -187,6 +190,65 @@ export function createConversationsRouter(
     validate({ body: CreateConversationBody }),
     createConversationHandler,
   )
+
+  const listMessagesHandler: RequestHandler = async (req, res) => {
+    if (!req.auth) {
+      throw new UnauthenticatedError()
+    }
+
+    const conversationId = req.params.id
+    if (typeof conversationId !== 'string') {
+      throw new NotFoundError('Conversation not found')
+    }
+
+    const parsedQuery = MessageHistoryQuery.safeParse(req.query)
+    if (!parsedQuery.success) {
+      const details = parsedQuery.error.issues.map((issue) => ({
+        path: issue.path.length > 0 ? issue.path.join('.') : 'query',
+        message: issue.message,
+      }))
+      throw new ValidationError('Invalid request', details)
+    }
+
+    const participant = await prisma.participant.findFirst({
+      where: {
+        conversationId,
+        userId: req.auth.userId,
+        leftAt: null,
+      },
+      select: { joinedAtSeq: true },
+    })
+    if (!participant) {
+      throw new NotFoundError('Conversation not found')
+    }
+
+    const { beforeSeq, afterSeq, limit } = parsedQuery.data
+    const rows = await prisma.message.findMany({
+      where: {
+        conversationId,
+        seq: {
+          gt:
+            afterSeq === undefined
+              ? participant.joinedAtSeq
+              : Math.max(participant.joinedAtSeq, afterSeq),
+          ...(beforeSeq === undefined ? {} : { lt: beforeSeq }),
+        },
+      },
+      orderBy: { seq: afterSeq === undefined ? 'desc' : 'asc' },
+      take: limit + 1,
+      include: messageWithReplyInclude,
+    })
+
+    const pageRows = rows.slice(0, limit)
+    res.status(200).json(
+      MessageHistoryResponse.parse({
+        items: pageRows.map(toMessageDto),
+        hasMore: rows.length > limit,
+      }),
+    )
+  }
+
+  router.get('/conversations/:id/messages', requireAuth, listMessagesHandler)
 
   const getConversationHandler: RequestHandler = async (req, res) => {
     if (!req.auth) {
