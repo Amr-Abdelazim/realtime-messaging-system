@@ -23,11 +23,13 @@ import { REFRESH_COOKIE_NAME } from '../../src/modules/auth/cookies.js'
 import { hashRefreshToken, signAccessToken } from '../../src/modules/auth/tokens.js'
 import { revokedSessionKey } from '../../src/modules/auth/sessions.js'
 import { MessagesService } from '../../src/modules/messages/messages.service.js'
+import { PresenceService } from '../../src/modules/presence/presence.service.js'
 import { createRealtimeServer } from '../../src/realtime/server.js'
 import { SocketGateway } from '../../src/realtime/socketGateway.js'
 import { disconnectDb, resetDb } from '../helpers/db.js'
 
 type TestSocket = ClientSocket<ServerToClientEvents, ClientToServerEvents>
+type PresenceUpdate = Parameters<ServerToClientEvents['presence:update']>[0]
 type EmptyAck = SocketAck<Record<string, never>>
 type ReadAck = SocketAck<{ unreadCount: number }>
 type DeleteAck = SocketAck<{ messageId: string; seq: number }>
@@ -93,6 +95,30 @@ function waitForReady(socket: TestSocket): Promise<{ serverTime: string }> {
     socket.once('ready', resolve)
     socket.once('connect_error', reject)
     socket.connect()
+  })
+}
+
+function waitForPresence(
+  socket: TestSocket,
+  userId: string,
+  online: boolean,
+  timeoutMs = 7_000,
+): Promise<PresenceUpdate> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      socket.off('presence:update', listener)
+      reject(new Error(`Timed out waiting for presence update for ${userId}`))
+    }, timeoutMs)
+    const listener = (event: PresenceUpdate) => {
+      if (event.userId !== userId || event.online !== online) {
+        return
+      }
+
+      clearTimeout(timeout)
+      socket.off('presence:update', listener)
+      resolve(event)
+    }
+    socket.on('presence:update', listener)
   })
 }
 
@@ -541,7 +567,7 @@ describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
       lastMessage: null,
       unreadCount: 0,
       myLastReadSeq: 0,
-      peerPresence: null,
+      peerPresence: { online: false, lastSeenAt: null },
     })
     expect(created.body.members).toHaveLength(2)
     expect(created.body.members.map((member: { userId: string }) => member.userId).sort()).toEqual(
@@ -1853,6 +1879,167 @@ describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
     }
     await new Promise((resolve) => setTimeout(resolve, 100))
     expect(receivedEvents).toBe(10)
+  })
+
+  it('tracks presence per socket and debounces the offline transition', async () => {
+    const user = await createRegisteredSession()
+    const peer = await createRegisteredSession()
+    const fallbackLastSeen = new Date('2025-01-02T03:04:05.000Z')
+    await prisma.user.update({
+      where: { id: user.auth.user.id },
+      data: { lastSeenAt: fallbackLastSeen },
+    })
+    const conversation = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${peer.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: user.auth.user.id })
+      .expect(201)
+    const conversationId = conversation.body.id as string
+    const headers = { authorization: `Bearer ${peer.auth.accessToken}` }
+
+    const initialDetail = await request(app)
+      .get(`/api/v1/conversations/${conversationId}`)
+      .set(headers)
+      .expect(200)
+    expect(initialDetail.body.peerPresence).toEqual({
+      online: false,
+      lastSeenAt: fallbackLastSeen.toISOString(),
+    })
+    const initialChatList = await request(app).get('/api/v1/conversations').set(headers).expect(200)
+    expect(initialChatList.body.items[0]?.peerPresence).toEqual(initialDetail.body.peerPresence)
+
+    const peerSocket = connectSocket(peer.auth.accessToken)
+    await waitForReady(peerSocket)
+    const userSocketOne = connectSocket(user.auth.accessToken)
+    const userSocketTwo = connectSocket(user.auth.accessToken)
+    const onlineEvent = waitForPresence(peerSocket, user.auth.user.id, true)
+    await waitForReady(userSocketOne)
+    expect(await onlineEvent).toEqual({
+      userId: user.auth.user.id,
+      online: true,
+      lastSeenAt: null,
+    })
+    const socketId = userSocketOne.id
+    if (!socketId) {
+      throw new Error('Expected the presence socket to have an id')
+    }
+    const initialScoreValue = await redis.zscore(`presence:${user.auth.user.id}`, socketId)
+    if (initialScoreValue === null) {
+      throw new Error('Expected the presence socket to have an expiry score')
+    }
+    const initialScore = Number(initialScoreValue)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    userSocketOne.emit('presence:ping')
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(Number(await redis.zscore(`presence:${user.auth.user.id}`, socketId))).toBeGreaterThan(
+      initialScore,
+    )
+    await waitForReady(userSocketTwo)
+
+    const onlinePresence = await request(app)
+      .get(`/api/v1/presence?ids=${user.auth.user.id}`)
+      .set(headers)
+      .expect(200)
+    expect(onlinePresence.body).toEqual({
+      items: [{ userId: user.auth.user.id, online: true, lastSeenAt: null }],
+    })
+    const onlineDetail = await request(app)
+      .get(`/api/v1/conversations/${conversationId}`)
+      .set(headers)
+      .expect(200)
+    expect(onlineDetail.body.peerPresence).toEqual({ online: true, lastSeenAt: null })
+
+    userSocketOne.disconnect()
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(await redis.zcard(`presence:${user.auth.user.id}`)).toBe(1)
+    const stillOnline = await request(app)
+      .get(`/api/v1/presence?ids=${user.auth.user.id}`)
+      .set(headers)
+      .expect(200)
+    expect(stillOnline.body.items[0]).toMatchObject({ online: true, lastSeenAt: null })
+
+    const offlineEvent = waitForPresence(peerSocket, user.auth.user.id, false)
+    userSocketTwo.disconnect()
+    const offlineUpdate = await offlineEvent
+    expect(offlineUpdate.lastSeenAt).toEqual(expect.any(String))
+    expect(Date.parse(offlineUpdate.lastSeenAt ?? '')).not.toBeNaN()
+    expect(await redis.sismember('presence:active', user.auth.user.id)).toBe(0)
+
+    const offlinePresence = await request(app)
+      .get(`/api/v1/presence?ids=${user.auth.user.id}`)
+      .set(headers)
+      .expect(200)
+    expect(offlinePresence.body.items[0]).toEqual({
+      userId: user.auth.user.id,
+      online: false,
+      lastSeenAt: offlineUpdate.lastSeenAt,
+    })
+    const offlineDetail = await request(app)
+      .get(`/api/v1/conversations/${conversationId}`)
+      .set(headers)
+      .expect(200)
+    expect(offlineDetail.body.peerPresence).toEqual({
+      online: false,
+      lastSeenAt: offlineUpdate.lastSeenAt,
+    })
+    const offlineChatList = await request(app).get('/api/v1/conversations').set(headers).expect(200)
+    expect(offlineChatList.body.items[0]?.peerPresence).toEqual(offlineDetail.body.peerPresence)
+  }, 15_000)
+
+  it('counts expired heartbeat scores as offline and suppresses reconnect flaps', async () => {
+    const user = await createRegisteredSession()
+    const lastSeenAt = new Date('2024-06-07T08:09:10.000Z')
+    await prisma.user.update({
+      where: { id: user.auth.user.id },
+      data: { lastSeenAt },
+    })
+    await redis.zadd(`presence:${user.auth.user.id}`, Date.now() - 1, 'expired-socket')
+    await redis.sadd('presence:active', user.auth.user.id)
+
+    const expiredPresence = await request(app)
+      .get(`/api/v1/presence?ids=${user.auth.user.id}`)
+      .set('authorization', `Bearer ${user.auth.accessToken}`)
+      .expect(200)
+    expect(expiredPresence.body.items).toEqual([
+      { userId: user.auth.user.id, online: false, lastSeenAt: lastSeenAt.toISOString() },
+    ])
+    expect(await redis.zcard(`presence:${user.auth.user.id}`)).toBe(0)
+    await request(app)
+      .get(`/api/v1/presence?ids=${Array.from({ length: 51 }, () => user.auth.user.id).join(',')}`)
+      .set('authorization', `Bearer ${user.auth.accessToken}`)
+      .expect(400)
+
+    const reconnectUserId = randomUUID()
+    const offlineTransitions: Array<{ userId: string; lastSeenAt: string }> = []
+    const onOffline = (userId: string, offlineAt: string): void => {
+      offlineTransitions.push({ userId, lastSeenAt: offlineAt })
+    }
+    const firstInstance = new PresenceService(onOffline, 30)
+    const secondInstance = new PresenceService(onOffline, 30)
+    try {
+      expect(await firstInstance.connect(reconnectUserId, 'socket-before-reconnect')).toBe(true)
+      await firstInstance.disconnect(reconnectUserId, 'socket-before-reconnect')
+      expect(await secondInstance.connect(reconnectUserId, 'socket-after-reconnect')).toBe(false)
+      await new Promise((resolve) => setTimeout(resolve, 60))
+      expect(offlineTransitions).toEqual([])
+      expect((await secondInstance.getPresence([reconnectUserId])).get(reconnectUserId)).toEqual({
+        online: true,
+        lastSeenAt: null,
+      })
+
+      await secondInstance.disconnect(reconnectUserId, 'socket-after-reconnect')
+      await new Promise((resolve) => setTimeout(resolve, 60))
+      expect(offlineTransitions).toHaveLength(1)
+      expect(offlineTransitions[0]?.userId).toBe(reconnectUserId)
+    } finally {
+      await redis.del(
+        `presence:${reconnectUserId}`,
+        `presence:pending-offline:${reconnectUserId}`,
+        `lastSeen:${reconnectUserId}`,
+      )
+      await redis.srem('presence:active', reconnectUserId)
+      await redis.srem('lastSeen:dirty', reconnectUserId)
+    }
   })
 
   it('deletes only the sender message once and preserves its tombstone in history and chat list', async () => {

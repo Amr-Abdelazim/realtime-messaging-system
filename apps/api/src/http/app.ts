@@ -14,6 +14,7 @@ import readyRouter from './routes/ready.js'
 import { createAuthRouter } from './routes/auth.js'
 import usersRouter from './routes/users.js'
 import { createConversationsRouter } from './routes/conversations.js'
+import presenceRouter from './routes/presence.js'
 import type { RateLimitPolicy } from '../infra/rateLimit.js'
 import type { RealtimeGateway } from '../realtime/gateway.js'
 
@@ -104,6 +105,7 @@ export function createApp(options: AppOptions = {}): Express {
   )
   app.use('/api/v1', usersRouter)
   app.use('/api/v1', createConversationsRouter(options.gateway))
+  app.use('/api/v1', presenceRouter)
   // Error handling (must remain last)
   app.use(notFoundHandler)
   app.use(errorHandler)

@@ -9,12 +9,14 @@ import { prisma } from '../infra/prisma.js'
 import { authenticateAccessToken } from '../modules/auth/access.js'
 import { MessagesService } from '../modules/messages/messages.service.js'
 import { MessageStatusService } from '../modules/messages/status.service.js'
+import { PresenceService } from '../modules/presence/presence.service.js'
 import { RateLimitedError } from '../http/errors/index.js'
 import { rateLimit } from '../infra/rateLimit.js'
 import {
   ConversationReadInput,
   MessageDeleteInput,
   MessageDeliveredInput,
+  PresencePingInput,
   SendMessageInput,
   TypingInput,
 } from '@realtime-messaging/contracts'
@@ -46,6 +48,15 @@ export function createRealtimeServer(
   )
 
   installSocketAuth(io, dependencies.authenticate ?? authenticateAccessToken)
+  const database = dependencies.prisma ?? prisma
+  const broadcastPresence = (
+    userId: string,
+    online: boolean,
+    lastSeenAt: string | null,
+  ): Promise<void> => broadcastPresenceUpdate(io, database, userId, online, lastSeenAt)
+  const presence = new PresenceService((userId, lastSeenAt) =>
+    broadcastPresence(userId, false, lastSeenAt),
+  )
   const messages = new MessagesService()
   const messageStatus = new MessageStatusService()
   io.on('connection', (socket) => {
@@ -65,16 +76,24 @@ export function createRealtimeServer(
       if (expiryTimer) {
         clearTimeout(expiryTimer)
       }
+      void presence.disconnect(socket.data.userId, socket.id).catch((error: unknown) => {
+        logger.error(
+          { err: error, socketId: socket.id, userId: socket.data.userId },
+          'Failed to update presence after disconnect',
+        )
+      })
     })
     disconnectAtExpiry()
 
-    void initializeConnection(socket, dependencies.prisma ?? prisma).catch((error: unknown) => {
-      logger.error(
-        { err: error, socketId: socket.id, userId: socket.data.userId },
-        'Failed to initialize socket connection',
-      )
-      socket.disconnect(true)
-    })
+    void initializeConnection(socket, database, presence, broadcastPresence).catch(
+      (error: unknown) => {
+        logger.error(
+          { err: error, socketId: socket.id, userId: socket.data.userId },
+          'Failed to initialize socket connection',
+        )
+        socket.disconnect(true)
+      },
+    )
 
     handle(socket, 'message:send', SendMessageInput, async (input) => {
       const rateLimitResult = await rateLimit({
@@ -174,6 +193,13 @@ export function createRealtimeServer(
     handle(socket, 'typing:stop', TypingInput, async ({ conversationId }) => {
       await handleTyping(conversationId, false)
     })
+
+    handle(socket, 'presence:ping', PresencePingInput, async () => {
+      const becameOnline = await presence.heartbeat(socket.data.userId, socket.id)
+      if (becameOnline) {
+        await broadcastPresence(socket.data.userId, true, null)
+      }
+    })
   })
 
   return io
@@ -182,6 +208,8 @@ export function createRealtimeServer(
 async function initializeConnection(
   socket: RealtimeSocket,
   database: Pick<PrismaClient, 'participant'>,
+  presence: PresenceService,
+  broadcastPresence: (userId: string, online: boolean, lastSeenAt: string | null) => Promise<void>,
 ): Promise<void> {
   const userId = socket.data.userId
   await socket.join(`user:${userId}`)
@@ -200,5 +228,31 @@ async function initializeConnection(
     return
   }
 
+  const becameOnline = await presence.connect(userId, socket.id)
+  if (!socket.connected || Date.now() >= socket.data.tokenExp * 1000) {
+    await presence.disconnect(userId, socket.id)
+    socket.disconnect(true)
+    return
+  }
+  if (becameOnline) {
+    await broadcastPresence(userId, true, null)
+  }
+
   socket.emit('ready', { serverTime: new Date().toISOString() })
+}
+
+async function broadcastPresenceUpdate(
+  io: RealtimeServer,
+  database: Pick<PrismaClient, 'participant'>,
+  userId: string,
+  online: boolean,
+  lastSeenAt: string | null,
+): Promise<void> {
+  const memberships = await database.participant.findMany({
+    where: { userId, leftAt: null },
+    select: { conversationId: true },
+  })
+  for (const { conversationId } of memberships) {
+    io.to(`conv:${conversationId}`).emit('presence:update', { userId, online, lastSeenAt })
+  }
 }

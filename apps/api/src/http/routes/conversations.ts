@@ -1,5 +1,6 @@
 import {
   AddConversationMembersBody,
+  type ConversationDto,
   ConversationListQuery,
   ConversationListResponse,
   ConversationReadBody,
@@ -24,10 +25,12 @@ import {
   conversationListSelect,
   toConversationDto,
   toConversationListDto,
+  type ConversationWithRelations,
 } from '../../modules/conversations/mappers.js'
 import { messageWithReplyInclude, toMessageDto } from '../../modules/messages/mappers.js'
 import { MessagesService } from '../../modules/messages/messages.service.js'
 import { MessageStatusService } from '../../modules/messages/status.service.js'
+import { PresenceService, type PresenceValue } from '../../modules/presence/presence.service.js'
 import { NoopGateway, type RealtimeGateway } from '../../realtime/gateway.js'
 
 export function createConversationsRouter(
@@ -37,6 +40,22 @@ export function createConversationsRouter(
   const conversations = new ConversationsService(gateway)
   const messages = new MessagesService()
   const messageStatus = new MessageStatusService()
+  const presence = new PresenceService()
+
+  const toConversationWithPresence = async (row: ConversationWithRelations, viewerId: string) => {
+    if (row.type !== 'DIRECT') {
+      return toConversationDto(row, viewerId)
+    }
+
+    const presenceByUser = await presence.getPresence(
+      row.participants.filter(({ userId }) => userId !== viewerId).map(({ userId }) => userId),
+    )
+    return toConversationDto(
+      row,
+      viewerId,
+      getPeerPresence(row.participants, viewerId, presenceByUser),
+    )
+  }
 
   const listHandler: RequestHandler = async (req, res) => {
     if (!req.auth) {
@@ -97,6 +116,14 @@ export function createConversationsRouter(
             _min: { lastDeliveredSeq: true, lastReadSeq: true },
           })
         : []
+    const directPeerIds = pageRows.flatMap(({ conversation }) =>
+      conversation.type === 'DIRECT'
+        ? conversation.participants
+            .filter(({ userId: peerId }) => peerId !== userId)
+            .map(({ userId: peerId }) => peerId)
+        : [],
+    )
+    const presenceByUser = await presence.getPresence(directPeerIds)
     const receiptsByConversation = new Map(
       receiptRows.map(({ conversationId, _min }) => [
         conversationId,
@@ -112,6 +139,9 @@ export function createConversationsRouter(
         userId,
         { unreadCount, lastReadSeq },
         receiptsByConversation.get(conversation.id) ?? { deliveredUpTo: 0, readUpTo: 0 },
+        conversation.type === 'DIRECT'
+          ? getPeerPresence(conversation.participants, userId, presenceByUser)
+          : null,
       ),
     )
     let nextCursor: string | null = null
@@ -197,7 +227,9 @@ export function createConversationsRouter(
         return { conversation, created: true }
       })
 
-      res.status(result.created ? 201 : 200).json(toConversationDto(result.conversation, userId))
+      res
+        .status(result.created ? 201 : 200)
+        .json(await toConversationWithPresence(result.conversation, userId))
     } catch (error) {
       if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== 'P2002') {
         throw error
@@ -211,7 +243,7 @@ export function createConversationsRouter(
         throw error
       }
 
-      res.status(200).json(toConversationDto(existing, userId))
+      res.status(200).json(await toConversationWithPresence(existing, userId))
     }
   }
 
@@ -360,7 +392,7 @@ export function createConversationsRouter(
       throw new NotFoundError('Conversation not found')
     }
 
-    res.status(200).json(toConversationDto(conversation, req.auth.userId))
+    res.status(200).json(await toConversationWithPresence(conversation, req.auth.userId))
   }
 
   router.get('/conversations/:id', requireAuth, getConversationHandler)
@@ -434,6 +466,31 @@ export function createConversationsRouter(
   router.post('/conversations/:id/leave', requireAuth, leaveGroupHandler)
 
   return router
+}
+
+type PresenceParticipant = {
+  userId: string
+  user: { lastSeenAt: Date | null }
+}
+
+function getPeerPresence(
+  participants: readonly PresenceParticipant[],
+  viewerId: string,
+  presenceByUser: Map<string, PresenceValue>,
+): NonNullable<ConversationDto['peerPresence']> | null {
+  const peer = participants.find(({ userId }) => userId !== viewerId)
+  if (!peer) {
+    return null
+  }
+
+  const presence = presenceByUser.get(peer.userId)
+  const online = presence?.online ?? false
+  return {
+    online,
+    lastSeenAt: online
+      ? null
+      : (presence?.lastSeenAt ?? peer.user.lastSeenAt?.toISOString() ?? null),
+  }
 }
 
 const ConversationCursorPayload = z
