@@ -44,11 +44,13 @@ socket.on('connect_error', (error) => {
 })
 
 const input = createInterface({ input: process.stdin, output: process.stdout })
-console.log('Commands: send <conversationId> <text>, help, reconnect, quit')
+const commands =
+  'Commands: send <conversationId> <text>, delivered <conversationId> <upToSeq>, read <conversationId> <upToSeq>, help, reconnect, quit'
+console.log(commands)
 input.on('line', (line) => {
   const command = line.trim()
   if (command.toLowerCase() === 'help') {
-    console.log('Commands: send <conversationId> <text>, help, reconnect, quit')
+    console.log(commands)
     return
   }
   if (command.toLowerCase() === 'reconnect') {
@@ -69,6 +71,24 @@ input.on('line', (line) => {
         { conversationId, clientMessageId: randomUUID(), content },
         (ack) => console.log('ack', ack),
       )
+      return
+    }
+  }
+
+  const statusCommand = /^(delivered|read)\s+(\S+)\s+(\d+)$/i.exec(command)
+  if (statusCommand) {
+    const [, action, conversationId, sequence] = statusCommand
+    const upToSeq = Number(sequence)
+    if (action && conversationId && Number.isSafeInteger(upToSeq)) {
+      if (action.toLowerCase() === 'delivered') {
+        socket.emit('message:delivered', { conversationId, upToSeq }, (ack) =>
+          console.log('ack', ack),
+        )
+      } else {
+        socket.emit('conversation:read', { conversationId, upToSeq }, (ack) =>
+          console.log('ack', ack),
+        )
+      }
       return
     }
   }

@@ -1,6 +1,7 @@
 import { z } from 'zod'
 
 import { IdSchema, IsoDateSchema } from './common.js'
+import { ConversationReceipts } from './status.js'
 
 const DirectCreateConversationBody = z.object({
   type: z.literal('DIRECT'),
@@ -25,6 +26,12 @@ export const UpdateConversationBody = z.object({
 })
 
 export type UpdateConversationBody = z.infer<typeof UpdateConversationBody>
+
+export const ConversationReadBody = z.object({
+  upToSeq: z.number().int().nonnegative(),
+})
+
+export type ConversationReadBody = z.infer<typeof ConversationReadBody>
 
 export const AddConversationMembersBody = z.object({
   userIds: z.array(IdSchema).min(1),
@@ -97,6 +104,7 @@ export const ConversationDto = z.object({
   lastMessage: MessageDto.nullable(),
   unreadCount: z.number().int(),
   myLastReadSeq: z.number().int(),
+  receipts: ConversationReceipts,
   peerPresence: z
     .object({
       online: z.boolean(),

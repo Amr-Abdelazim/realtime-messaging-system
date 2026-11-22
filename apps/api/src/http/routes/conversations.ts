@@ -2,6 +2,7 @@ import {
   AddConversationMembersBody,
   ConversationListQuery,
   ConversationListResponse,
+  ConversationReadBody,
   CreateConversationBody,
   IdSchema,
   IsoDateSchema,
@@ -25,6 +26,7 @@ import {
   toConversationListDto,
 } from '../../modules/conversations/mappers.js'
 import { messageWithReplyInclude, toMessageDto } from '../../modules/messages/mappers.js'
+import { MessageStatusService } from '../../modules/messages/status.service.js'
 import { NoopGateway, type RealtimeGateway } from '../../realtime/gateway.js'
 
 export function createConversationsRouter(
@@ -32,6 +34,7 @@ export function createConversationsRouter(
 ): ExpressRouter {
   const router: ExpressRouter = Router()
   const conversations = new ConversationsService(gateway)
+  const messageStatus = new MessageStatusService()
 
   const listHandler: RequestHandler = async (req, res) => {
     if (!req.auth) {
@@ -80,8 +83,34 @@ export function createConversationsRouter(
 
     const hasMore = rows.length > limit
     const pageRows = rows.slice(0, limit)
+    const receiptRows =
+      pageRows.length > 0
+        ? await prisma.participant.groupBy({
+            by: ['conversationId'],
+            where: {
+              conversationId: { in: pageRows.map(({ conversation }) => conversation.id) },
+              userId: { not: userId },
+              leftAt: null,
+            },
+            _min: { lastDeliveredSeq: true, lastReadSeq: true },
+          })
+        : []
+    const receiptsByConversation = new Map(
+      receiptRows.map(({ conversationId, _min }) => [
+        conversationId,
+        {
+          deliveredUpTo: _min.lastDeliveredSeq ?? 0,
+          readUpTo: _min.lastReadSeq ?? 0,
+        },
+      ]),
+    )
     const items = pageRows.map(({ conversation, unreadCount, lastReadSeq }) =>
-      toConversationListDto(conversation, userId, { unreadCount, lastReadSeq }),
+      toConversationListDto(
+        conversation,
+        userId,
+        { unreadCount, lastReadSeq },
+        receiptsByConversation.get(conversation.id) ?? { deliveredUpTo: 0, readUpTo: 0 },
+      ),
     )
     let nextCursor: string | null = null
     if (hasMore) {
@@ -249,6 +278,36 @@ export function createConversationsRouter(
   }
 
   router.get('/conversations/:id/messages', requireAuth, listMessagesHandler)
+
+  const readConversationHandler: RequestHandler = async (req, res) => {
+    if (!req.auth) {
+      throw new UnauthenticatedError()
+    }
+
+    const conversationId = req.params.id
+    if (typeof conversationId !== 'string') {
+      throw new NotFoundError('Conversation not found')
+    }
+
+    const { upToSeq } = ConversationReadBody.parse(req.body)
+    const result = await messageStatus.markRead(req.auth.userId, conversationId, upToSeq)
+    if (result.advanced) {
+      gateway.toConversation(conversationId, 'message:status', {
+        conversationId,
+        userId: req.auth.userId,
+        kind: 'read',
+        upToSeq: result.upToSeq,
+      })
+    }
+    res.status(204).end()
+  }
+
+  router.post(
+    '/conversations/:id/read',
+    requireAuth,
+    validate({ body: ConversationReadBody }),
+    readConversationHandler,
+  )
 
   const getConversationHandler: RequestHandler = async (req, res) => {
     if (!req.auth) {
