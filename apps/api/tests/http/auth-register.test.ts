@@ -11,6 +11,7 @@ import { createApp } from '../../src/http/app.js'
 import { redis } from '../../src/infra/redis.js'
 import { REFRESH_COOKIE_NAME } from '../../src/modules/auth/cookies.js'
 import { hashRefreshToken, signAccessToken } from '../../src/modules/auth/tokens.js'
+import { revokedSessionKey } from '../../src/modules/auth/sessions.js'
 import { disconnectDb, resetDb } from '../helpers/db.js'
 
 const app = createApp()
@@ -23,6 +24,31 @@ const makeRegistration = () => {
     username: `user_${suffix}`,
     password: 'Password123!',
     displayName: 'Test User',
+  }
+}
+
+function getRefreshToken(response: { headers: { 'set-cookie'?: string[] } }): string {
+  const cookie = response.headers['set-cookie']?.find((value) =>
+    value.startsWith(`${REFRESH_COOKIE_NAME}=`),
+  )
+  const cookieValue = cookie?.split(';', 1)[0]
+  const token = cookieValue?.slice(`${REFRESH_COOKIE_NAME}=`.length)
+
+  if (!token) {
+    throw new Error('Refresh cookie was not set')
+  }
+
+  return token
+}
+
+async function createRegisteredSession() {
+  const registration = makeRegistration()
+  const response = await request(app).post('/api/v1/auth/register').send(registration).expect(201)
+
+  return {
+    registration,
+    auth: AuthResponse.parse(response.body),
+    refreshToken: getRefreshToken(response),
   }
 }
 
@@ -283,5 +309,179 @@ describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
         expect.objectContaining({ path: 'password' }),
       ]),
     )
+  })
+
+  it('rotates tokens, tolerates a grace-period replay, and logs out', async () => {
+    const { auth, refreshToken: originalRefreshToken } = await createRegisteredSession()
+    const originalSession = await prisma.session.findUniqueOrThrow({
+      where: { tokenHash: hashRefreshToken(originalRefreshToken) },
+    })
+
+    const firstRefresh = await request(app)
+      .post('/api/v1/auth/refresh')
+      .set('Cookie', `${REFRESH_COOKIE_NAME}=${originalRefreshToken}`)
+      .set('user-agent', 't07-refresh-test-agent')
+      .expect(200)
+    const firstRotatedToken = getRefreshToken(firstRefresh)
+    const firstRotatedSession = await prisma.session.findUniqueOrThrow({
+      where: { tokenHash: hashRefreshToken(firstRotatedToken) },
+    })
+
+    expect(firstRefresh.body.accessToken).toBeTypeOf('string')
+    expect(firstRotatedToken).not.toBe(originalRefreshToken)
+    expect(originalSession.familyId).toBe(firstRotatedSession.familyId)
+    expect(firstRotatedSession.userAgent).toBe('t07-refresh-test-agent')
+    expect(
+      (await prisma.session.findUniqueOrThrow({ where: { id: originalSession.id } })).revokedAt,
+    ).not.toBeNull()
+
+    const replay = await request(app)
+      .post('/api/v1/auth/refresh')
+      .set('Cookie', `${REFRESH_COOKIE_NAME}=${originalRefreshToken}`)
+      .expect(401)
+    expect(replay.headers['set-cookie']?.[0]).toContain(`${REFRESH_COOKIE_NAME}=;`)
+
+    const currentUser = await request(app)
+      .get('/api/v1/users/me')
+      .set('authorization', `Bearer ${firstRefresh.body.accessToken}`)
+      .expect(200)
+    expect(currentUser.body.id).toBe(auth.user.id)
+
+    const secondRefresh = await request(app)
+      .post('/api/v1/auth/refresh')
+      .set('Cookie', `${REFRESH_COOKIE_NAME}=${firstRotatedToken}`)
+      .expect(200)
+    const currentRefreshToken = getRefreshToken(secondRefresh)
+    const currentSession = await prisma.session.findUniqueOrThrow({
+      where: { tokenHash: hashRefreshToken(currentRefreshToken) },
+    })
+    const redisKey = revokedSessionKey(currentSession.id)
+
+    try {
+      await request(app)
+        .post('/api/v1/auth/logout')
+        .set('Cookie', `${REFRESH_COOKIE_NAME}=${currentRefreshToken}`)
+        .expect(204)
+      await request(app)
+        .get('/api/v1/users/me')
+        .set('authorization', `Bearer ${secondRefresh.body.accessToken}`)
+        .expect(401)
+      const loggedOutRefresh = await request(app)
+        .post('/api/v1/auth/refresh')
+        .set('Cookie', `${REFRESH_COOKIE_NAME}=${currentRefreshToken}`)
+        .expect(401)
+      expect(loggedOutRefresh.headers['set-cookie']?.[0]).toContain(`${REFRESH_COOKIE_NAME}=;`)
+    } finally {
+      await redis.del(redisKey)
+    }
+  })
+
+  it('revokes the whole family when a refresh token is reused after the grace period', async () => {
+    const { auth, refreshToken: stolenRefreshToken } = await createRegisteredSession()
+    const rotated = await request(app)
+      .post('/api/v1/auth/refresh')
+      .set('Cookie', `${REFRESH_COOKIE_NAME}=${stolenRefreshToken}`)
+      .expect(200)
+    const rotatedPayload = await jwtVerify(
+      rotated.body.accessToken,
+      new TextEncoder().encode(env.JWT_ACCESS_SECRET),
+    )
+    if (typeof rotatedPayload.payload.sid !== 'string') {
+      throw new Error('Rotated token did not contain a session id')
+    }
+
+    const originalSession = await prisma.session.findUniqueOrThrow({
+      where: { tokenHash: hashRefreshToken(stolenRefreshToken) },
+    })
+    await prisma.session.update({
+      where: { id: originalSession.id },
+      data: { revokedAt: new Date(Date.now() - 11_000) },
+    })
+
+    try {
+      const reuse = await request(app)
+        .post('/api/v1/auth/refresh')
+        .set('Cookie', `${REFRESH_COOKIE_NAME}=${stolenRefreshToken}`)
+        .expect(401)
+      expect(reuse.headers['set-cookie']?.[0]).toContain(`${REFRESH_COOKIE_NAME}=;`)
+
+      const family = await prisma.session.findMany({
+        where: { familyId: originalSession.familyId },
+      })
+      expect(family.length).toBeGreaterThanOrEqual(2)
+      expect(family.every((session) => session.revokedAt !== null)).toBe(true)
+      expect(family.every((session) => session.userId === auth.user.id)).toBe(true)
+      expect(await redis.get(revokedSessionKey(rotatedPayload.payload.sid))).toBe('1')
+
+      await request(app)
+        .get('/api/v1/users/me')
+        .set('authorization', `Bearer ${rotated.body.accessToken}`)
+        .expect(401)
+      expect(auth.user.id).toBe(originalSession.userId)
+    } finally {
+      const family = await prisma.session.findMany({
+        where: { familyId: originalSession.familyId },
+        select: { id: true },
+      })
+      await Promise.all(family.map(({ id }) => redis.del(revokedSessionKey(id))))
+    }
+  })
+
+  it('rejects and clears an expired refresh session', async () => {
+    const { refreshToken } = await createRegisteredSession()
+    const session = await prisma.session.findUniqueOrThrow({
+      where: { tokenHash: hashRefreshToken(refreshToken) },
+    })
+    await prisma.session.update({
+      where: { id: session.id },
+      data: { expiresAt: new Date(Date.now() - 1) },
+    })
+
+    const response = await request(app)
+      .post('/api/v1/auth/refresh')
+      .set('Cookie', `${REFRESH_COOKIE_NAME}=${refreshToken}`)
+      .expect(401)
+
+    expect(response.headers['set-cookie']?.[0]).toContain(`${REFRESH_COOKIE_NAME}=;`)
+    expect(
+      await prisma.session.count({
+        where: { userId: session.userId },
+      }),
+    ).toBe(1)
+  })
+
+  it('logs out idempotently and immediately revokes the access token', async () => {
+    const { auth, refreshToken } = await createRegisteredSession()
+    const session = await prisma.session.findUniqueOrThrow({
+      where: { tokenHash: hashRefreshToken(refreshToken) },
+    })
+    const redisKey = revokedSessionKey(session.id)
+
+    try {
+      const logout = await request(app)
+        .post('/api/v1/auth/logout')
+        .set('Cookie', `${REFRESH_COOKIE_NAME}=${refreshToken}`)
+        .expect(204)
+      expect(logout.headers['set-cookie']?.[0]).toContain(`${REFRESH_COOKIE_NAME}=;`)
+      expect(
+        (await prisma.session.findUniqueOrThrow({ where: { id: session.id } })).revokedAt,
+      ).not.toBeNull()
+      expect(await redis.get(redisKey)).toBe('1')
+      expect(await redis.ttl(redisKey)).toBeLessThanOrEqual(env.JWT_ACCESS_TTL_SECONDS)
+      expect(await redis.ttl(redisKey)).toBeGreaterThan(0)
+
+      await request(app)
+        .get('/api/v1/users/me')
+        .set('authorization', `Bearer ${auth.accessToken}`)
+        .expect(401)
+
+      await request(app)
+        .post('/api/v1/auth/logout')
+        .set('Cookie', `${REFRESH_COOKIE_NAME}=${refreshToken}`)
+        .expect(204)
+      await request(app).post('/api/v1/auth/logout').expect(204)
+    } finally {
+      await redis.del(redisKey)
+    }
   })
 })
