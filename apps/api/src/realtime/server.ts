@@ -8,9 +8,14 @@ import { logger } from '../infra/logger.js'
 import { prisma } from '../infra/prisma.js'
 import { authenticateAccessToken } from '../modules/auth/access.js'
 import { MessagesService } from '../modules/messages/messages.service.js'
+import { MessageStatusService } from '../modules/messages/status.service.js'
 import { RateLimitedError } from '../http/errors/index.js'
 import { rateLimit } from '../infra/rateLimit.js'
-import { SendMessageInput } from '@realtime-messaging/contracts'
+import {
+  ConversationReadInput,
+  MessageDeliveredInput,
+  SendMessageInput,
+} from '@realtime-messaging/contracts'
 import { installSocketAuth } from './auth.js'
 import { handle } from './handler.js'
 import type { RealtimeServer, RealtimeSocket, SocketData } from './types.js'
@@ -40,6 +45,7 @@ export function createRealtimeServer(
 
   installSocketAuth(io, dependencies.authenticate ?? authenticateAccessToken)
   const messages = new MessagesService()
+  const messageStatus = new MessageStatusService()
   io.on('connection', (socket) => {
     const expiryTime = socket.data.tokenExp * 1000
     let expiryTimer: NodeJS.Timeout | undefined
@@ -85,6 +91,40 @@ export function createRealtimeServer(
         io.to(`conv:${input.conversationId}`).emit('message:new', { message: result.message })
       }
       return result
+    })
+
+    handle(socket, 'message:delivered', MessageDeliveredInput, async (input) => {
+      const result = await messageStatus.markDelivered(
+        socket.data.userId,
+        input.conversationId,
+        input.upToSeq,
+      )
+      if (result.advanced) {
+        io.to(`conv:${input.conversationId}`).emit('message:status', {
+          conversationId: input.conversationId,
+          userId: socket.data.userId,
+          kind: 'delivered',
+          upToSeq: result.upToSeq,
+        })
+      }
+      return {}
+    })
+
+    handle(socket, 'conversation:read', ConversationReadInput, async (input) => {
+      const result = await messageStatus.markRead(
+        socket.data.userId,
+        input.conversationId,
+        input.upToSeq,
+      )
+      if (result.advanced) {
+        io.to(`conv:${input.conversationId}`).emit('message:status', {
+          conversationId: input.conversationId,
+          userId: socket.data.userId,
+          kind: 'read',
+          upToSeq: result.upToSeq,
+        })
+      }
+      return { unreadCount: result.unreadCount }
     })
   })
 

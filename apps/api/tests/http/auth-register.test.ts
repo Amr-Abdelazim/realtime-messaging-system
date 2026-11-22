@@ -28,6 +28,8 @@ import { SocketGateway } from '../../src/realtime/socketGateway.js'
 import { disconnectDb, resetDb } from '../helpers/db.js'
 
 type TestSocket = ClientSocket<ServerToClientEvents, ClientToServerEvents>
+type EmptyAck = SocketAck<Record<string, never>>
+type ReadAck = SocketAck<{ unreadCount: number }>
 
 const socketGateway = new SocketGateway()
 const app = createApp({
@@ -117,6 +119,20 @@ function sendInvalidMessage(
   return new Promise((resolve) => {
     socket.emit('message:send', input as never, resolve)
   })
+}
+
+function markDelivered(
+  socket: TestSocket,
+  input: { conversationId: string; upToSeq: number },
+): Promise<EmptyAck> {
+  return new Promise((resolve) => socket.emit('message:delivered', input, resolve))
+}
+
+function markRead(
+  socket: TestSocket,
+  input: { conversationId: string; upToSeq: number },
+): Promise<ReadAck> {
+  return new Promise((resolve) => socket.emit('conversation:read', input, resolve))
 }
 
 async function createRegisteredSession(
@@ -1347,6 +1363,34 @@ describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
       .send({ type: 'GROUP', name: 'Chat list group', memberIds: memberRows.map(({ id }) => id) })
       .expect(201)
 
+    const activeParticipants = await prisma.participant.findMany({
+      where: { conversationId: group.body.id, leftAt: null },
+      orderBy: [{ joinedAt: 'asc' }, { userId: 'asc' }],
+      select: { userId: true },
+    })
+    const visibleParticipantIds = new Set(
+      activeParticipants.slice(0, 5).map(({ userId }) => userId),
+    )
+    const hiddenMember = activeParticipants.find(
+      ({ userId }) => userId !== owner.auth.user.id && !visibleParticipantIds.has(userId),
+    )
+    if (!hiddenMember) {
+      throw new Error('Expected a group member outside the chat-list preview')
+    }
+    await Promise.all(
+      activeParticipants.map(({ userId }) =>
+        prisma.participant.update({
+          where: {
+            conversationId_userId: { conversationId: group.body.id, userId },
+          },
+          data:
+            userId === hiddenMember.userId
+              ? { lastDeliveredSeq: 1, lastReadSeq: 0 }
+              : { lastDeliveredSeq: 10, lastReadSeq: 8 },
+        }),
+      ),
+    )
+
     const response = await request(app)
       .get('/api/v1/conversations')
       .set('authorization', `Bearer ${owner.auth.accessToken}`)
@@ -1357,6 +1401,7 @@ describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
       id: group.body.id,
       type: 'GROUP',
       memberCount: 7,
+      receipts: { deliveredUpTo: 1, readUpTo: 0 },
     })
     expect(response.body.items[0].members).toHaveLength(5)
   })
@@ -1697,6 +1742,135 @@ describe.skipIf(process.env.CI !== 'true')('Authentication API', () => {
     expect(participants.find(({ userId }) => userId === recipient.auth.user.id)?.unreadCount).toBe(
       1,
     )
+  })
+
+  it('advances delivery and read watermarks monotonically and recounts unread messages', async () => {
+    const sender = await createRegisteredSession()
+    const reader = await createRegisteredSession()
+    const outsider = await createRegisteredSession()
+    const conversation = await request(app)
+      .post('/api/v1/conversations')
+      .set('authorization', `Bearer ${sender.auth.accessToken}`)
+      .send({ type: 'DIRECT', userId: reader.auth.user.id })
+      .expect(201)
+    const conversationId = conversation.body.id as string
+
+    const messages = await prisma.message.createManyAndReturn({
+      data: [
+        {
+          conversationId,
+          seq: 1,
+          senderId: sender.auth.user.id,
+          content: 'one',
+          clientMessageId: randomUUID(),
+        },
+        {
+          conversationId,
+          seq: 2,
+          senderId: reader.auth.user.id,
+          content: 'two',
+          clientMessageId: randomUUID(),
+        },
+        {
+          conversationId,
+          seq: 3,
+          senderId: null,
+          type: 'SYSTEM',
+          content: 'system event',
+          clientMessageId: randomUUID(),
+        },
+        {
+          conversationId,
+          seq: 4,
+          senderId: sender.auth.user.id,
+          content: 'four',
+          clientMessageId: randomUUID(),
+        },
+        {
+          conversationId,
+          seq: 5,
+          senderId: sender.auth.user.id,
+          content: 'deleted',
+          clientMessageId: randomUUID(),
+          deletedAt: new Date(),
+        },
+      ],
+    })
+    const lastMessage = messages.at(-1)
+    if (!lastMessage) {
+      throw new Error('Expected seeded messages')
+    }
+    await prisma.conversation.update({
+      where: { id: conversationId },
+      data: { lastSeq: 5, lastMessageId: lastMessage.id, lastMessageAt: new Date() },
+    })
+    await prisma.participant.update({
+      where: {
+        conversationId_userId: { conversationId, userId: reader.auth.user.id },
+      },
+      data: { unreadCount: 4 },
+    })
+
+    const senderSocket = connectSocket(sender.auth.accessToken)
+    const readerSocket = connectSocket(reader.auth.accessToken)
+    const outsiderSocket = connectSocket(outsider.auth.accessToken)
+    await Promise.all([
+      waitForReady(senderSocket),
+      waitForReady(readerSocket),
+      waitForReady(outsiderSocket),
+    ])
+    const statusEvents: Array<{ kind: string; upToSeq: number }> = []
+    senderSocket.on('message:status', ({ kind, upToSeq }) => statusEvents.push({ kind, upToSeq }))
+
+    const deliveredEvent = new Promise<{ kind: string; upToSeq: number }>((resolve) => {
+      senderSocket.once('message:status', resolve)
+    })
+    const delivered = await markDelivered(readerSocket, { conversationId, upToSeq: 3 })
+    expect(delivered.ok).toBe(true)
+    expect(await deliveredEvent).toMatchObject({ kind: 'delivered', upToSeq: 3 })
+    expect((await markDelivered(readerSocket, { conversationId, upToSeq: 2 })).ok).toBe(true)
+    const beyondLastSeq = await markDelivered(readerSocket, { conversationId, upToSeq: 6 })
+    expect(beyondLastSeq).toMatchObject({
+      ok: false,
+      error: { code: 'VALIDATION_ERROR' },
+    })
+    const forbidden = await markDelivered(outsiderSocket, { conversationId, upToSeq: 1 })
+    expect(forbidden).toMatchObject({ ok: false, error: { code: 'FORBIDDEN' } })
+
+    const readEvent = new Promise<{ kind: string; upToSeq: number }>((resolve) => {
+      senderSocket.once('message:status', resolve)
+    })
+    const read = await markRead(readerSocket, { conversationId, upToSeq: 2 })
+    expect(read).toEqual({ ok: true, data: { unreadCount: 2 } })
+    expect(await readEvent).toMatchObject({ kind: 'read', upToSeq: 2 })
+    expect(await markRead(readerSocket, { conversationId, upToSeq: 1 })).toEqual({
+      ok: true,
+      data: { unreadCount: 2 },
+    })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(statusEvents).toEqual([
+      { kind: 'delivered', upToSeq: 3 },
+      { kind: 'read', upToSeq: 2 },
+    ])
+
+    await request(app)
+      .post(`/api/v1/conversations/${conversationId}/read`)
+      .set('authorization', `Bearer ${reader.auth.accessToken}`)
+      .send({ upToSeq: 3 })
+      .expect(204)
+    const readerParticipant = await prisma.participant.findUniqueOrThrow({
+      where: { conversationId_userId: { conversationId, userId: reader.auth.user.id } },
+    })
+    expect(readerParticipant).toMatchObject({
+      lastDeliveredSeq: 3,
+      lastReadSeq: 3,
+      unreadCount: 1,
+    })
+    const outOfRangeRead = await request(app)
+      .post(`/api/v1/conversations/${conversationId}/read`)
+      .set('authorization', `Bearer ${reader.auth.accessToken}`)
+      .send({ upToSeq: 6 })
+    expect(outOfRangeRead.status).toBe(400)
   })
 
   it('serializes fifty concurrent message sends from both conversation members', async () => {

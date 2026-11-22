@@ -1,5 +1,6 @@
 import { z } from 'zod'
 
+import { ConversationReadBody } from './conversations.js'
 import { IdSchema } from './common.js'
 import { MessageDto, type ConversationDto } from './conversations.js'
 
@@ -22,6 +23,19 @@ export const SendMessageAck = z.object({
 
 export type SendMessageAck = z.infer<typeof SendMessageAck>
 
+export const MessageDeliveredInput = z.object({
+  conversationId: IdSchema,
+  upToSeq: z.number().int().nonnegative(),
+})
+
+export type MessageDeliveredInput = z.infer<typeof MessageDeliveredInput>
+
+export const ConversationReadInput = ConversationReadBody.extend({
+  conversationId: IdSchema,
+})
+
+export type ConversationReadInput = z.infer<typeof ConversationReadInput>
+
 export interface ClientToServerEvents {
   'message:send': (
     payload: SendMessageInput,
@@ -32,11 +46,11 @@ export interface ClientToServerEvents {
     ack: (response: SocketAck<{ messageId: string; seq: number }>) => void,
   ) => void
   'message:delivered': (
-    payload: { conversationId: string; upToSeq: number },
+    payload: MessageDeliveredInput,
     ack: (response: SocketAck<Record<string, never>>) => void,
   ) => void
   'conversation:read': (
-    payload: { conversationId: string; upToSeq: number },
+    payload: ConversationReadInput,
     ack: (response: SocketAck<{ unreadCount: number }>) => void,
   ) => void
   'typing:start': (payload: { conversationId: string }) => void

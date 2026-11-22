@@ -7,6 +7,7 @@ import {
   ConversationDto,
   ConversationListQuery,
   ConversationListResponse,
+  deriveStatus,
   CreateConversationBody,
   ErrorCode,
   ErrorEnvelope,
@@ -178,6 +179,7 @@ describe('shared contracts', () => {
         lastMessage: null,
         unreadCount: 0,
         myLastReadSeq: 0,
+        receipts: { deliveredUpTo: 0, readUpTo: 0 },
         peerPresence: null,
       }).type,
     ).toBe('DIRECT')
@@ -202,6 +204,13 @@ describe('shared contracts', () => {
       items: [],
       hasMore: false,
     })
+  })
+
+  it('derives message status from the peer receipts', () => {
+    const receipts = { deliveredUpTo: 4, readUpTo: 2 }
+    expect(deriveStatus(2, receipts)).toBe('read')
+    expect(deriveStatus(4, receipts)).toBe('delivered')
+    expect(deriveStatus(5, receipts)).toBe('sent')
   })
 
   it('validates socket message-send payloads and acknowledgements', () => {

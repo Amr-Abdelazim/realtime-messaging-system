@@ -1,4 +1,8 @@
-import { ConversationDto } from '@realtime-messaging/contracts'
+import {
+  ConversationDto,
+  ConversationReceipts,
+  type ConversationReceipts as ConversationReceiptsType,
+} from '@realtime-messaging/contracts'
 import { Prisma } from '@prisma/client'
 
 import {
@@ -16,6 +20,7 @@ export const conversationInclude = {
       role: true,
       unreadCount: true,
       lastReadSeq: true,
+      lastDeliveredSeq: true,
       user: {
         select: {
           displayName: true,
@@ -43,6 +48,7 @@ export const conversationListSelect = {
       role: true,
       unreadCount: true,
       lastReadSeq: true,
+      lastDeliveredSeq: true,
       user: {
         select: {
           displayName: true,
@@ -76,6 +82,7 @@ function mapConversationDto(
   participants: ConversationMember[],
   memberCount: number,
   viewer: { unreadCount: number; lastReadSeq: number },
+  receipts: ConversationReceiptsType,
 ) {
   return ConversationDto.parse({
     id: row.id,
@@ -92,7 +99,20 @@ function mapConversationDto(
     lastMessage: row.lastMessage ? toMessageDto(row.lastMessage) : null,
     unreadCount: viewer.unreadCount,
     myLastReadSeq: viewer.lastReadSeq,
+    receipts,
     peerPresence: null,
+  })
+}
+
+function getReceipts(
+  participants: ConversationMember[],
+  viewerId: string,
+): ConversationReceiptsType {
+  const peers = participants.filter((participant) => participant.userId !== viewerId)
+  return ConversationReceipts.parse({
+    deliveredUpTo:
+      peers.length > 0 ? Math.min(...peers.map(({ lastDeliveredSeq }) => lastDeliveredSeq)) : 0,
+    readUpTo: peers.length > 0 ? Math.min(...peers.map(({ lastReadSeq }) => lastReadSeq)) : 0,
   })
 }
 
@@ -102,17 +122,24 @@ export function toConversationDto(row: ConversationWithRelations, viewerId: stri
     throw new Error('Cannot map a conversation for a non-member')
   }
 
-  return mapConversationDto(row, row.participants, row.participants.length, viewer)
+  return mapConversationDto(
+    row,
+    row.participants,
+    row.participants.length,
+    viewer,
+    getReceipts(row.participants, viewerId),
+  )
 }
 
 export function toConversationListDto(
   row: ConversationListRow,
   viewerId: string,
   viewer: { unreadCount: number; lastReadSeq: number },
+  receipts: ConversationReceiptsType,
 ) {
   const members =
     row.type === 'DIRECT'
       ? row.participants.filter((participant) => participant.userId !== viewerId)
       : row.participants
-  return mapConversationDto(row, members, row._count.participants, viewer)
+  return mapConversationDto(row, members, row._count.participants, viewer, receipts)
 }
