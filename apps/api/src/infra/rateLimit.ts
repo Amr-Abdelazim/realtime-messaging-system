@@ -1,4 +1,5 @@
 import { redis } from './redis.js'
+import { rateLimited } from './metrics.js'
 
 export type RateLimitPolicy = {
   limit: number
@@ -28,6 +29,10 @@ export async function rateLimit({
   }
 
   const ttl = await redis.ttl(key)
+  if (count > limit) {
+    rateLimited.inc()
+  }
+
   return {
     allowed: count <= limit,
     retryAfterSeconds: Math.max(1, ttl),

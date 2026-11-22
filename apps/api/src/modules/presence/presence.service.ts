@@ -68,6 +68,8 @@ export type PresenceValue = {
 export type PresenceChangeHandler = (userId: string, lastSeenAt: string) => void | Promise<void>
 
 export class PresenceService {
+  private readonly pendingOfflineTransitions = new Set<Promise<void>>()
+
   constructor(
     private readonly onOffline?: PresenceChangeHandler,
     private readonly debounceMs = 5_000,
@@ -100,11 +102,27 @@ export class PresenceService {
       return
     }
 
+    let completeTransition: () => void = () => {}
+    const transition = new Promise<void>((resolve) => {
+      completeTransition = resolve
+    })
+    this.pendingOfflineTransitions.add(transition)
     setTimeout(() => {
-      void this.finalizeDisconnect(userId, token).catch((error: unknown) => {
-        logger.error({ err: error, userId }, 'Failed to finalize presence disconnect')
-      })
+      void this.finalizeDisconnect(userId, token)
+        .catch((error: unknown) => {
+          logger.error({ err: error, userId }, 'Failed to finalize presence disconnect')
+        })
+        .finally(() => {
+          this.pendingOfflineTransitions.delete(transition)
+          completeTransition()
+        })
     }, this.debounceMs)
+  }
+
+  async waitForPendingOfflineTransitions(): Promise<void> {
+    while (this.pendingOfflineTransitions.size > 0) {
+      await Promise.all(this.pendingOfflineTransitions)
+    }
   }
 
   async getPresence(userIds: string[]): Promise<Map<string, PresenceValue>> {

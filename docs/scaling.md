@@ -26,6 +26,11 @@ API and Socket.IO traffic is balanced between `api1` and `api2`. Inspect
 `instanceId` for each process. The worker runs last-seen flush and presence
 sweep every 30 seconds, session cleanup hourly, and unread reconciliation at
 midnight UTC. The database and Redis are available only on the Compose network.
+Each API instance exposes Prometheus metrics on its internal port; nginx returns
+404 for `/metrics` so the scrape endpoint is not publicly proxied. On `SIGTERM`
+or `SIGINT`, an API instance becomes unready, drains in-flight work, disconnects
+its sockets, and closes Redis and Postgres connections. Shutdown is bounded by
+a 15-second hard timeout.
 
 ## Realtime message path
 

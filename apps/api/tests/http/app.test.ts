@@ -78,4 +78,12 @@ describe('HTTP application', () => {
     expect([200, 503]).toContain(response.status)
     expect(['ready', 'not_ready']).toContain(response.body.status)
   })
+
+  it('should report not ready while shutting down', async () => {
+    const shuttingDownApp = createApp({ isShuttingDown: () => true })
+    const response = await request(shuttingDownApp).get('/ready')
+
+    expect(response.status).toBe(503)
+    expect(response.body).toEqual({ status: 'shutting_down' })
+  })
 })
